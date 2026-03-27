@@ -1,0 +1,161 @@
+# Changelog
+
+All notable fork-specific changes in this repository will be documented in this file.
+
+This repository is a standalone extracted fork layered on top of `darvell/codex-pool`.
+It does not preserve upstream git ancestry. The documented imported Go-core baseline is
+`darvell/codex-pool@4570f6b`.
+
+The format is loosely based on Keep a Changelog. Versioning rules are defined in
+[`VERSIONING.md`](./VERSIONING.md).
+
+## [0.8.0] - 2026-03-27
+
+### Added
+- Browser-first Antigravity Gemini onboarding on `/` and `/status`, including provider-truth persistence for project identity, subscription tier, protected models, typed quota snapshots, and warm-seat state.
+- OpenCode export and guided setup surfaces (`/config/opencode/<token>` and `/setup/opencode/<token>`) plus Anthropic-compatible Gemini adapters for `/v1/messages` and `/v1/chat/completions`.
+- Loopback-only Gemini operator diagnostics and reset tooling: seat smoke, `reset-bundle`, `reset-delete`, and `reset-rollback` with manifest snapshots and rollback artifacts.
+- Provider-scoped request tracing for OAuth exchange, token refresh, health probe, facade routing, and metadata-cache events across Codex, Claude, and Gemini lanes.
+
+### Changed
+- Gemini routing is now sticky-until-pressure and gates on provider truth, warm-seat state, quota pressure, project availability, and observed operational failure before rotating to another seat.
+- `/status`, `/status?format=json`, the landing page, Gemini CLI setup, and OpenCode export now project the same `provider_truth`, `operational_truth`, `routing.state`, `gemini_pool`, `provider_quota_summary`, and compatibility-lane contract.
+- Gemini CLI setup now keeps clients on the pool root URL in external API-key mode, while legacy local/manual Gemini import is retired from the operator surface in favor of browser-first Antigravity auth.
+- Codex route readiness, models-cache fetches, OAuth exchange, API-key probes, and refresh flows now emit trace data and preserve the exact `>= 90%` quota cutoff with sticky seat reuse.
+
+### Fixed
+- Restarted Gemini seats now refresh stale provider truth and empty-quota snapshots more truthfully instead of collapsing eligible seats into stale-routing dead ends.
+- OpenCode exports no longer let blocked `missing_project_id` seats steal `activeIndex`; disabled seats stay visible, but they do not become the active account.
+- Gemini reset rollback now validates operator-managed paths before delete/restore, closing the path-traversal gap in the reset tooling.
+- Restricted Antigravity seats can now be diagnosed and, when appropriate, exercised through the fallback project without flattening provider restrictions into generic operational failure.
+
+## [0.7.0] - 2026-03-25
+
+### Added
+- Antigravity-backed Gemini onboarding on `/` and `/status`, including browser OAuth start/callback, Antigravity account JSON import normalization, Code Assist project bootstrap, and persistence of provider-truth fields needed for routing.
+- A pooled Gemini `/v1beta/models/*:generateContent|streamGenerateContent` facade that rewrites supported requests into the Code Assist `v1internal` lane for imported Antigravity-backed seats.
+- Claude request-trace correlation from wrapper to pool, including per-request trace headers, SSE/usage event counters, `chunk_gap` detection, and explicit idle-timeout diagnostics.
+- Focused regression coverage for Gemini provider persistence, Antigravity onboarding, dashboard/operator JSON truth, setup scripts, facade transforms, and request-trace behavior.
+
+### Changed
+- Gemini CLI setup scripts now keep the client in external API key mode with `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL` instead of the earlier OAuth-bypass environment shape.
+- Gemini seat persistence and routing now keep operator/source provenance plus provider block-state fields such as `proxy_disabled`, `validation_blocked`, quota-forbidden status, subscription tier, and validation metadata.
+- `/status`, `/status?format=json`, and the landing page now describe Gemini seats with Antigravity import provenance and provider-truth fields instead of treating all non-managed seats as one generic manual-import lane.
+- Explicit force-refresh paths now bypass the Gemini per-account refresh throttle when the operator asks for a real refresh.
+
+### Fixed
+- Gemini `v1beta` requests no longer route onto imported seats that lack the Antigravity project ID required for the Code Assist facade.
+- Idle SSE timeout detection now records real timeout state instead of collapsing into a generic downstream `context canceled`.
+- Local Claude tracing can now be correlated end-to-end without leaking wrapper-only headers upstream.
+
+## [0.6.1] - 2026-03-24
+
+### Changed
+- Gemini operator surfaces now split managed OAuth onboarding from manual `oauth_creds.json` import instead of presenting them as one mixed flow.
+- `/status?format=json` now exposes explicit Gemini operator truth via `gemini_operator` and per-account `operator_source` labels so the landing page and `/status` can describe the same pool composition.
+- When the local service has no configured Gemini OAuth client, the managed Gemini CTA now degrades honestly into an unavailable note instead of looking like another working onboarding path.
+
+### Fixed
+- Manual Gemini `oauth_creds.json` import is no longer mislabeled as a fallback/API pool. Imported credentials are shown as regular Gemini seats with explicit source labels.
+
+## [0.6.0] - 2026-03-24
+
+### Added
+- Managed Gemini operator onboarding on both `/` and `/status`, including loopback OAuth start/callback handling, popup/manual-open recovery, and raw `oauth_creds.json` fallback paste flow.
+- Explicit long-dead-seat quarantine handling and operator visibility for quarantined accounts across status JSON, status HTML, and the landing overview.
+- Persistent Codex usage snapshots with restore-time reload support, plus a local cached `/backend-api/codex/models` path to reduce fragile upstream metadata round-trips.
+- Additional focused regression coverage for Gemini persistence, Codex usage restore/rotation, quarantine visibility, and fallback/request-path behavior.
+
+### Changed
+- The local landing page now mirrors real operator truth from `/status?format=json` instead of acting like a separate setup-only surface. It exposes live `Codex`, `Claude`, and `Gemini` dashboards, cleanup status, operator actions, and deletion controls in one place.
+- Codex routing now keeps one active local seat until threshold, restores usage state across restart more truthfully, honors local cooldown windows, and avoids retry-path active-seat poisoning.
+- Codex fallback operation is now explicitly operator-visible: fallback API keys are health-probed, displayed separately from local seats, and proven to take live traffic when local Codex seats are temporarily unavailable.
+- Managed Gemini and GitLab Claude state handling now round-trips more of the operator-visible runtime fields across save/load/reload boundaries.
+
+### Fixed
+- Codex seats no longer forget recent quota state on restart and immediately drift back onto already-burned accounts because of stale or missing usage snapshots.
+- Local Codex seats that hit live cooldown now leave fresh rotation instead of remaining eligible behind a debug-only bypass.
+- The active Codex lease is no longer rewritten by retry-only fallthrough candidates that never actually won a successful request.
+- The landing/dashboard surfaces no longer hide quarantine and dead-seat cleanup truth behind `/status` only.
+- Managed Gemini OAuth client credentials are no longer hardcoded in the repository; the operator flow now expects them from the local service environment.
+
+## [0.5.1] - 2026-03-23
+
+### Changed
+- Refactored buffered, streamed, and websocket proxy response handling into smaller explicit seams so retryable status inspection, copied-response delivery, websocket success recovery, and pooled websocket proxy execution are no longer mixed into large inline handler blocks.
+- Shared pre-copy status inspection and replay handling between streamed and websocket lanes while keeping their remaining transport-specific differences explicit.
+- Hydrated the next websocket execution-shell follow-up (`T31`) in repo-local SSOT so the ongoing refactor wave is traceable from plan to evidence.
+- Replaced screenshot-heavy README sections with text-first operator documentation aligned with the current dashboard-first local UI.
+
+### Added
+- Focused buffered regression coverage for managed API and GitLab Claude retry/failover paths.
+- Shared proxy account snapshot helpers for buffered, streamed, and websocket response-path tests.
+- Additional websocket finalizer coverage for non-`101` successful recovery and failed-handshake no-op behavior.
+
+## [0.5.0] - 2026-03-23
+
+### Added
+- GitLab-backed Claude pooling with managed Duo direct-access token minting.
+- Operator-facing GitLab Claude token onboarding and pool visibility in `/status`.
+- Dashboard-first local landing with live `Codex`, `Claude`, and `Gemini` views powered by `/status?format=json`.
+- Additional operator controls for fallback API keys, GitLab Claude tokens, and manual account deletion on the dashboard surfaces.
+- GitLab-specific status/admin visibility for cooldowns, quota backoff counters, and direct-access rate-limit signals.
+
+### Changed
+- Extracted proxy admission logic out of the main request handler.
+- Introduced explicit request-planning contracts for route selection.
+- Enforced Codex seat cutoff at `>= 90%` usage and added sticky seat reuse.
+- Unified usage ingestion across body, headers, and stream paths.
+- Extracted shared response stream usage recording helpers.
+- Reused shared retry/error/finalization handling across buffered, streamed, and websocket proxy paths.
+- Replaced the old setup-first local landing with a provider-dashboard-first operator surface and removed the decorative hero treatment.
+- Hardened managed GitLab Claude persistence into one canonical fail-closed serializer and shortened status/admin lock scope with snapshot-based rendering.
+
+### Fixed
+- Ordinary non-stream Claude `/v1/messages` responses now contribute to local usage totals.
+- Streamed and websocket managed-upstream inspection now preserves client-visible error bodies while still classifying retryable failures.
+- GitLab Claude gateway `402/401/403` handling now rotates correctly, persists cooldown state, and avoids falsely killing healthy source tokens.
+- Malformed successful GitLab direct-access refresh responses now become explicit `error` state and clear stale gateway auth material instead of remaining deceptively healthy.
+
+## [0.4.0] - 2026-03-22
+
+### Added
+- OpenAI API fallback pool support for Codex execution.
+- Managed API key health probing and status visibility.
+- Operator UI flows for adding and deleting OpenAI API keys.
+- Routing support for fallback-only managed API accounts.
+
+### Changed
+- Codex routing can now fall through to the API key pool when subscription seats are not usable.
+- `/status` gained operator-facing API pool visibility and controls.
+
+## [0.3.0] - 2026-03-21
+
+### Changed
+- Tightened `/status` dashboard wording and operator logic.
+- Improved operator-facing auth and refresh timestamps.
+- Reduced noisy raw/internal links on the local operator page.
+
+## [0.2.0] - 2026-03-21
+
+### Added
+- Codex websocket authentication handling for pooled seats.
+- Dead-seat detection and automatic failover for deactivated Codex accounts.
+
+### Changed
+- Hardened Codex websocket request handling and recovery behavior.
+
+## [0.1.0] - 2026-03-19
+
+### Added
+- Standalone deployment assets around the upstream proxy core.
+- `systemd/codex-pool.service`.
+- Install and security documentation.
+- Operator-oriented landing and status flows for self-hosted deployment.
+
+## Upstream Divergence Notes
+
+- Imported upstream baseline: `darvell/codex-pool@4570f6b`
+- Current upstream head at comparison time: `darvell/codex-pool@cf782a7`
+- This fork is intentionally more operator-centric and Codex-centric than upstream.
+- Upstream may contain newer generic provider features that are not mirrored here.
