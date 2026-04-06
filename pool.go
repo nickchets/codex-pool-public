@@ -199,6 +199,13 @@ func routingStateLocked(a *Account, now time.Time, accountType AccountType, requ
 		state.BlockReason = "missing_gateway_state"
 		return state
 	}
+	if isGitLabCodexAccount(a) && missingGitLabCodexGatewayState(a) {
+		if strings.TrimSpace(a.RefreshToken) == "" {
+			state.Eligible = false
+			state.BlockReason = "missing_gateway_state"
+			return state
+		}
+	}
 	if a.Type == AccountTypeGemini {
 		syncGeminiProviderTruthStateLocked(a)
 		freshness := geminiProviderTruthFreshnessStatus(a.GeminiProviderTruthState, a.GeminiProviderCheckedAt, a.GeminiQuotaUpdatedAt, now)
@@ -226,9 +233,16 @@ func routingStateLocked(a *Account, now time.Time, accountType AccountType, requ
 		}
 		switch strings.TrimSpace(a.GeminiProviderTruthState) {
 		case geminiProviderTruthStateMissingProjectID:
-			state.Eligible = false
-			state.BlockReason = "missing_project_id"
-			return state
+			if effectiveGeminiCodeAssistProjectID(a) == "" {
+				state.Eligible = false
+				state.BlockReason = "missing_project_id"
+				return state
+			}
+			if !geminiHasOperationalProof(a.GeminiOperationalState) {
+				state.Eligible = false
+				state.BlockReason = "not_warmed"
+				return state
+			}
 		case geminiProviderTruthStateRestricted, geminiProviderTruthStateProjectOnlyUnverified, geminiProviderTruthStateAuthOnly:
 			if !geminiHasOperationalProof(a.GeminiOperationalState) {
 				state.Eligible = false
@@ -336,6 +350,7 @@ type Account struct {
 	GeminiQuotaModels               []GeminiModelQuotaSnapshot
 	GeminiQuotaUpdatedAt            time.Time
 	GeminiModelForwardingRules      map[string]string
+	GeminiModelRateLimitResetTimes  map[string]time.Time
 	// AccountID corresponds to Codex `auth.json` field `tokens.account_id`.
 	// Codex uses this value as the `ChatGPT-Account-ID` header.
 	AccountID string
@@ -386,6 +401,24 @@ func accountAuthMode(a *Account) string {
 
 func isManagedCodexAPIKeyAccount(a *Account) bool {
 	return a != nil && a.Type == AccountTypeCodex && accountAuthMode(a) == accountAuthModeAPIKey
+}
+
+func codexRequiresGitLabPlan(requiredPlan string) bool {
+	return strings.EqualFold(strings.TrimSpace(requiredPlan), accountAuthModeGitLab) ||
+		strings.EqualFold(strings.TrimSpace(requiredPlan), "gitlab_duo")
+}
+
+func codexAccountMatchesSelectionMode(a *Account, requiredPlan string, managed bool) bool {
+	if a == nil || a.Type != AccountTypeCodex {
+		return false
+	}
+	if managed {
+		return isManagedCodexAPIKeyAccount(a)
+	}
+	if codexRequiresGitLabPlan(requiredPlan) {
+		return isGitLabCodexAccount(a)
+	}
+	return !isManagedCodexAPIKeyAccount(a) && !isGitLabCodexAccount(a)
 }
 
 func normalizeGeminiOperatorSource(source, profileID string, accountType AccountType) string {
@@ -534,18 +567,31 @@ func (a *Account) applyRequestUsage(u RequestUsage) {
 
 // CodexAuthJSON is the format for Codex auth.json files.
 type CodexAuthJSON struct {
-	OpenAIKey       *string    `json:"OPENAI_API_KEY"`
-	Tokens          *TokenData `json:"tokens"`
-	LastRefresh     *time.Time `json:"last_refresh"`
-	LastHealthyAt   *time.Time `json:"last_healthy_at"`
-	HealthCheckedAt *time.Time `json:"health_checked_at"`
-	DeadSince       *time.Time `json:"dead_since"`
-	HealthStatus    string     `json:"health_status"`
-	HealthError     string     `json:"health_error"`
-	PlanType        string     `json:"plan_type"`
-	AuthMode        string     `json:"auth_mode"`
-	Dead            bool       `json:"dead"`
-	Disabled        bool       `json:"disabled"`
+	OpenAIKey                 *string           `json:"OPENAI_API_KEY"`
+	Tokens                    *TokenData        `json:"tokens"`
+	LastRefresh               *time.Time        `json:"last_refresh,omitempty"`
+	LastHealthyAt             *time.Time        `json:"last_healthy_at,omitempty"`
+	HealthCheckedAt           *time.Time        `json:"health_checked_at,omitempty"`
+	DeadSince                 *time.Time        `json:"dead_since,omitempty"`
+	HealthStatus              string            `json:"health_status,omitempty"`
+	HealthError               string            `json:"health_error,omitempty"`
+	PlanType                  string            `json:"plan_type,omitempty"`
+	AuthMode                  string            `json:"auth_mode,omitempty"`
+	Dead                      bool              `json:"dead"`
+	Disabled                  bool              `json:"disabled,omitempty"`
+	GitLabToken               string            `json:"gitlab_token,omitempty"`
+	GitLabInstanceURL         string            `json:"gitlab_instance_url,omitempty"`
+	GitLabGatewayToken        string            `json:"gitlab_gateway_token,omitempty"`
+	GitLabGatewayBaseURL      string            `json:"gitlab_gateway_base_url,omitempty"`
+	GitLabGatewayHeaders      map[string]string `json:"gitlab_gateway_headers,omitempty"`
+	GitLabGatewayExpiresAt    *time.Time        `json:"gitlab_gateway_expires_at,omitempty"`
+	GitLabRateLimitName       string            `json:"gitlab_rate_limit_name,omitempty"`
+	GitLabRateLimitLimit      int               `json:"gitlab_rate_limit_limit,omitempty"`
+	GitLabRateLimitRemaining  int               `json:"gitlab_rate_limit_remaining,omitempty"`
+	GitLabRateLimitResetAt    *time.Time        `json:"gitlab_rate_limit_reset_at,omitempty"`
+	GitLabQuotaExceededCount  int               `json:"gitlab_quota_exceeded_count,omitempty"`
+	GitLabLastQuotaExceededAt *time.Time        `json:"gitlab_last_quota_exceeded_at,omitempty"`
+	RateLimitUntil            *time.Time        `json:"rate_limit_until,omitempty"`
 }
 
 type TokenData struct {
@@ -629,6 +675,7 @@ type GeminiAuthJSON struct {
 	GeminiQuotaModels              []GeminiModelQuotaSnapshot `json:"gemini_quota_models,omitempty"`
 	GeminiQuotaUpdatedAt           *time.Time                 `json:"gemini_quota_updated_at,omitempty"`
 	GeminiModelForwardingRules     map[string]string          `json:"gemini_model_forwarding_rules,omitempty"`
+	GeminiModelRateLimitResetTimes map[string]time.Time       `json:"gemini_model_rate_limit_reset_times,omitempty"`
 }
 
 func syncGeminiProviderTruthState(acc *Account) {
@@ -739,6 +786,9 @@ func successfulGeminiOperationalStateLocked(acc *Account) (string, string) {
 	if state == "" || state == geminiProviderTruthStateReady {
 		return geminiOperationalTruthStateCleanOK, ""
 	}
+	if state == geminiProviderTruthStateMissingProjectID && effectiveGeminiCodeAssistProjectID(acc) != "" {
+		return geminiOperationalTruthStateDegradedOK, "fallback project in use; provider truth missing project_id"
+	}
 	return geminiOperationalTruthStateDegradedOK, sanitizeStatusMessage(firstNonEmpty(
 		strings.TrimSpace(acc.GeminiProviderTruthReason),
 		geminiValidationReasonSummary(acc.GeminiValidationReasonCode, acc.GeminiValidationMessage, acc.GeminiValidationURL, state),
@@ -749,6 +799,7 @@ func noteGeminiOperationalSuccessLocked(acc *Account, now time.Time, source stri
 	if acc == nil || acc.Type != AccountTypeGemini {
 		return
 	}
+	pruneExpiredGeminiModelRateLimitResetTimesLocked(acc, now)
 	state, reason := successfulGeminiOperationalStateLocked(acc)
 	acc.RateLimitUntil = time.Time{}
 	acc.GeminiOperationalState = state
@@ -758,7 +809,21 @@ func noteGeminiOperationalSuccessLocked(acc *Account, now time.Time, source stri
 	acc.GeminiOperationalLastSuccessAt = now.UTC()
 }
 
+func noteGeminiOperationalCooldownLocked(acc *Account, now time.Time, source, reason string) {
+	if acc == nil || acc.Type != AccountTypeGemini {
+		return
+	}
+	acc.GeminiOperationalState = geminiOperationalTruthStateCooldown
+	acc.GeminiOperationalReason = sanitizeStatusMessage(reason)
+	acc.GeminiOperationalSource = strings.TrimSpace(source)
+	acc.GeminiOperationalCheckedAt = now.UTC()
+}
+
 func noteGeminiOperationalFailureLocked(acc *Account, now time.Time, source string, err error) {
+	noteGeminiOperationalFailureForModelLocked(acc, now, source, err, "", "")
+}
+
+func noteGeminiOperationalFailureForModelLocked(acc *Account, now time.Time, source string, err error, requestedModel, path string) {
 	if acc == nil || acc.Type != AccountTypeGemini || err == nil {
 		return
 	}
@@ -767,7 +832,9 @@ func noteGeminiOperationalFailureLocked(acc *Account, now time.Time, source stri
 		acc.GeminiOperationalReason = sanitizeStatusMessage(firstNonEmpty(reason, err.Error()))
 		acc.GeminiOperationalSource = strings.TrimSpace(source)
 		acc.GeminiOperationalCheckedAt = now.UTC()
-		if precise || acc.RateLimitUntil.Before(until) {
+		if modelKey := noteGeminiModelRateLimitedLocked(acc, requestedModel, path, until); modelKey != "" {
+			acc.RateLimitUntil = time.Time{}
+		} else if precise || acc.RateLimitUntil.Before(until) {
 			acc.RateLimitUntil = until.UTC()
 		}
 		return
@@ -778,7 +845,9 @@ func noteGeminiOperationalFailureLocked(acc *Account, now time.Time, source stri
 		acc.GeminiOperationalReason = sanitizeStatusMessage(err.Error())
 		acc.GeminiOperationalSource = strings.TrimSpace(source)
 		acc.GeminiOperationalCheckedAt = now.UTC()
-		if acc.RateLimitUntil.Before(until) {
+		if modelKey := noteGeminiModelRateLimitedLocked(acc, requestedModel, path, until); modelKey != "" {
+			acc.RateLimitUntil = time.Time{}
+		} else if acc.RateLimitUntil.Before(until) {
 			acc.RateLimitUntil = until.UTC()
 		}
 		return
@@ -893,6 +962,51 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return out
 }
 
+func cloneTimeMap(values map[string]time.Time) map[string]time.Time {
+	if len(values) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	normalized := make(map[string]time.Time, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(rewriteGeminiCodeAssistFacadeModel(key))
+		if key == "" || value.IsZero() {
+			continue
+		}
+		keys = append(keys, key)
+		normalized[key] = value.UTC()
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	sort.Strings(keys)
+	out := make(map[string]time.Time, len(keys))
+	for _, key := range keys {
+		out[key] = normalized[key]
+	}
+	return out
+}
+
+func normalizeGeminiModelRateLimitResetTimes(values map[string]time.Time, now time.Time) map[string]time.Time {
+	cloned := cloneTimeMap(values)
+	if len(cloned) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		return cloned
+	}
+	filtered := make(map[string]time.Time, len(cloned))
+	for key, value := range cloned {
+		if value.After(now) {
+			filtered[key] = value.UTC()
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return cloneTimeMap(filtered)
+}
+
 func cloneSupportedMimeTypes(values map[string]bool) map[string]bool {
 	if len(values) == 0 {
 		return nil
@@ -965,6 +1079,140 @@ func cloneGeminiModelQuotaSnapshots(models []GeminiModelQuotaSnapshot) []GeminiM
 		return nil
 	}
 	return out
+}
+
+func parseGeminiQuotaModelResetTime(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.UTC()
+		}
+	}
+	return time.Time{}
+}
+
+func requestedGeminiModelRateLimitKey(requestedModel, path string) string {
+	if model, _, ok := parseGeminiAPIPath(strings.TrimSpace(path)); ok {
+		return rewriteGeminiCodeAssistFacadeModel(model)
+	}
+	return rewriteGeminiCodeAssistFacadeModel(strings.TrimSpace(requestedModel))
+}
+
+func geminiQuotaModelRateLimitUntil(models []GeminiModelQuotaSnapshot, requestedModel string, now time.Time) (time.Time, bool) {
+	requestedModel = strings.TrimSpace(rewriteGeminiCodeAssistFacadeModel(requestedModel))
+	if requestedModel == "" {
+		return time.Time{}, false
+	}
+	for _, model := range models {
+		modelName := strings.TrimSpace(rewriteGeminiCodeAssistFacadeModel(model.Name))
+		if modelName == "" || modelName != requestedModel {
+			continue
+		}
+		routeProvider := firstNonEmpty(strings.TrimSpace(model.RouteProvider), geminiQuotaModelRouteProvider(modelName))
+		if routeProvider != "gemini" || model.Percentage < 100 {
+			continue
+		}
+		resetAt := parseGeminiQuotaModelResetTime(model.ResetTime)
+		if resetAt.After(now) {
+			return resetAt.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func pruneExpiredGeminiModelRateLimitResetTimesLocked(acc *Account, now time.Time) {
+	if acc == nil || len(acc.GeminiModelRateLimitResetTimes) == 0 {
+		return
+	}
+	for key, resetAt := range acc.GeminiModelRateLimitResetTimes {
+		if resetAt.IsZero() || !resetAt.After(now) {
+			delete(acc.GeminiModelRateLimitResetTimes, key)
+		}
+	}
+	if len(acc.GeminiModelRateLimitResetTimes) == 0 {
+		acc.GeminiModelRateLimitResetTimes = nil
+	}
+}
+
+func noteGeminiModelRateLimitedLocked(acc *Account, requestedModel, path string, until time.Time) string {
+	if acc == nil || acc.Type != AccountTypeGemini || until.IsZero() {
+		return ""
+	}
+	modelKey := requestedGeminiModelRateLimitKey(requestedModel, path)
+	if modelKey == "" {
+		return ""
+	}
+	pruneExpiredGeminiModelRateLimitResetTimesLocked(acc, time.Now().UTC())
+	if acc.GeminiModelRateLimitResetTimes == nil {
+		acc.GeminiModelRateLimitResetTimes = make(map[string]time.Time)
+	}
+	if prev := acc.GeminiModelRateLimitResetTimes[modelKey]; prev.Before(until) {
+		acc.GeminiModelRateLimitResetTimes[modelKey] = until.UTC()
+	}
+	return modelKey
+}
+
+func geminiRequestedModelRateLimitUntilLocked(acc *Account, requestedModel, path string, now time.Time) (time.Time, string, bool) {
+	if acc == nil || acc.Type != AccountTypeGemini {
+		return time.Time{}, "", false
+	}
+	modelKey := requestedGeminiModelRateLimitKey(requestedModel, path)
+	if modelKey == "" {
+		return time.Time{}, "", false
+	}
+	pruneExpiredGeminiModelRateLimitResetTimesLocked(acc, now)
+	if until, ok := acc.GeminiModelRateLimitResetTimes[modelKey]; ok && until.After(now) {
+		return until.UTC(), modelKey, true
+	}
+	if until, ok := geminiQuotaModelRateLimitUntil(acc.GeminiQuotaModels, modelKey, now); ok {
+		return until.UTC(), modelKey, true
+	}
+	return time.Time{}, modelKey, false
+}
+
+func mergeGeminiQuotaModelsWithLiveRateLimitResetTimes(models []GeminiModelQuotaSnapshot, resets map[string]time.Time, now time.Time) []GeminiModelQuotaSnapshot {
+	base := cloneGeminiModelQuotaSnapshots(models)
+	resets = normalizeGeminiModelRateLimitResetTimes(resets, now)
+	if len(resets) == 0 {
+		return base
+	}
+
+	out := make([]GeminiModelQuotaSnapshot, len(base))
+	copy(out, base)
+	indexByName := make(map[string]int, len(out))
+	for idx, model := range out {
+		indexByName[strings.TrimSpace(rewriteGeminiCodeAssistFacadeModel(model.Name))] = idx
+	}
+
+	for modelName, resetAt := range resets {
+		modelName = strings.TrimSpace(rewriteGeminiCodeAssistFacadeModel(modelName))
+		if modelName == "" || !resetAt.After(now) {
+			continue
+		}
+		if idx, ok := indexByName[modelName]; ok {
+			if out[idx].Percentage < 100 {
+				out[idx].Percentage = 100
+			}
+			if current := parseGeminiQuotaModelResetTime(out[idx].ResetTime); current.IsZero() || current.Before(resetAt) {
+				out[idx].ResetTime = resetAt.UTC().Format(time.RFC3339)
+			}
+			if strings.TrimSpace(out[idx].RouteProvider) == "" {
+				out[idx].RouteProvider = "gemini"
+			}
+			continue
+		}
+		out = append(out, GeminiModelQuotaSnapshot{
+			Name:          modelName,
+			RouteProvider: "gemini",
+			Percentage:    100,
+			ResetTime:     resetAt.UTC().Format(time.RFC3339),
+		})
+	}
+
+	return cloneGeminiModelQuotaSnapshots(out)
 }
 
 func geminiQuotaModelRouteProvider(name string) string {
@@ -1080,6 +1328,7 @@ func loadPool(dir string, registry *ProviderRegistry) ([]*Account, error) {
 	}
 	providerDirs := []providerDir{
 		{name: "codex", accountType: AccountTypeCodex},
+		{name: "codex_gitlab", accountType: AccountTypeCodex},
 		{name: "openai_api", accountType: AccountTypeCodex},
 		{name: "claude", accountType: AccountTypeClaude},
 		{name: "claude_gitlab", accountType: AccountTypeClaude},
@@ -1297,9 +1546,9 @@ func accountTier(accType AccountType, planType string) int {
 // Selection strategy:
 //  1. Conversation pinning (stickiness) — only unpin at hard limits
 //  2. Reuse the most recently used eligible account for new unpinned work
-//  3. Split remaining eligible accounts into Tier 1 and Tier 2
-//  4. If any Tier 1 account has secondary < tierThreshold → pick from Tier 1
-//  5. Else if any Tier 2 account has secondary < tierThreshold → pick from Tier 2
+//  3. For Codex fallback, pick the best eligible seat from the highest available tier
+//  4. For other providers, split remaining eligible accounts into Tier 1 and Tier 2
+//  5. Prefer accounts under tierThreshold within the best tier
 //  6. Else → pick from all accounts with most headroom
 //  7. Within a tier, use score as tiebreaker (headroom, drain urgency, recency, inflight)
 func (p *poolState) candidate(conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string) *Account {
@@ -1361,7 +1610,7 @@ func (p *poolState) pinnedEligibleCandidateLocked(now time.Time, conversationID 
 		log.Printf("ignoring rate limit for codex account %s (until %s)",
 			id, a.RateLimitUntil.Format(time.RFC3339))
 	}
-	if ok && !a.ExpiresAt.IsZero() && a.ExpiresAt.Before(now) {
+	if ok && authExpiryBlocksStickySelectionLocked(a, now) {
 		ok = false
 		if p.debug {
 			log.Printf("unpinning conversation %s from expired account %s",
@@ -1389,9 +1638,12 @@ func (p *poolState) stickyEligibleCandidateLocked(now time.Time, exclude map[str
 			return acc
 		}
 		if acc := p.stickyEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, func(a *Account) bool {
-			return !isManagedCodexAPIKeyAccount(a)
+			return codexAccountMatchesSelectionMode(a, requiredPlan, false)
 		}); acc != nil {
 			return acc
+		}
+		if codexRequiresGitLabPlan(requiredPlan) {
+			return nil
 		}
 		return p.stickyEligibleCandidateMatchingLocked(now, exclude, accountType, "", func(a *Account) bool {
 			return isManagedCodexAPIKeyAccount(a)
@@ -1401,6 +1653,11 @@ func (p *poolState) stickyEligibleCandidateLocked(now time.Time, exclude map[str
 		if acc := p.activeGeminiCandidateLocked(now, exclude, requiredPlan); acc != nil {
 			return acc
 		}
+	}
+	if accountType == AccountTypeClaude {
+		return p.stickyEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, func(a *Account) bool {
+			return !isGitLabClaudeAccount(a)
+		})
 	}
 	return p.stickyEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, nil)
 }
@@ -1447,6 +1704,18 @@ func (p *poolState) activeGeminiCandidateLocked(now time.Time, exclude map[strin
 	return a
 }
 
+func authExpiryBlocksStickySelectionLocked(a *Account, now time.Time) bool {
+	if a == nil || a.ExpiresAt.IsZero() || !a.ExpiresAt.Before(now) {
+		return false
+	}
+	// Local Codex seats refresh on demand when access tokens are expired, so expiry
+	// alone should not eject the active/sticky seat ahead of the hard 10% routing gate.
+	if a.Type == AccountTypeCodex && strings.TrimSpace(a.RefreshToken) != "" {
+		return false
+	}
+	return true
+}
+
 func (p *poolState) activeCodexCandidateLocked(now time.Time, exclude map[string]bool, requiredPlan string, managed bool) *Account {
 	activeID := p.activeCodexID
 	if managed {
@@ -1466,9 +1735,8 @@ func (p *poolState) activeCodexCandidateLocked(now time.Time, exclude map[string
 	}
 
 	a.mu.Lock()
-	expired := !a.ExpiresAt.IsZero() && a.ExpiresAt.Before(now)
 	routing := routingStateLocked(a, now, AccountTypeCodex, requiredPlan)
-	ok := routing.Eligible && !expired && (isManagedCodexAPIKeyAccount(a) == managed)
+	ok := routing.Eligible && !authExpiryBlocksStickySelectionLocked(a, now) && codexAccountMatchesSelectionMode(a, requiredPlan, managed)
 	a.mu.Unlock()
 	if !ok {
 		p.clearActiveCodexSeatLocked(managed)
@@ -1499,9 +1767,8 @@ func (p *poolState) stickyEligibleCandidateMatchingLocked(now time.Time, exclude
 
 		a.mu.Lock()
 		lastUsed := a.LastUsed
-		expired := !a.ExpiresAt.IsZero() && a.ExpiresAt.Before(now)
 		routing := routingStateLocked(a, now, accountType, requiredPlan)
-		ok := routing.Eligible && !expired && !lastUsed.IsZero()
+		ok := routing.Eligible && !authExpiryBlocksStickySelectionLocked(a, now) && !lastUsed.IsZero()
 		if ok && (sticky == nil || lastUsed.After(stickyLastUsed)) {
 			sticky = a
 			stickyLastUsed = lastUsed
@@ -1514,22 +1781,25 @@ func (p *poolState) stickyEligibleCandidateMatchingLocked(now time.Time, exclude
 
 func (p *poolState) selectEligibleCandidateLocked(now time.Time, exclude map[string]bool, accountType AccountType, requiredPlan string, advanceRR bool) *Account {
 	if accountType == AccountTypeCodex {
-		if acc := p.selectEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, advanceRR, func(a *Account) bool {
-			return !isManagedCodexAPIKeyAccount(a)
+		if acc := p.selectEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, advanceRR, true, func(a *Account) bool {
+			return codexAccountMatchesSelectionMode(a, requiredPlan, false)
 		}); acc != nil {
 			return acc
+		}
+		if codexRequiresGitLabPlan(requiredPlan) {
+			return nil
 		}
 		if acc := p.activeCodexCandidateLocked(now, exclude, "", true); acc != nil {
 			return acc
 		}
-		return p.selectEligibleCandidateMatchingLocked(now, exclude, accountType, "", advanceRR, func(a *Account) bool {
+		return p.selectEligibleCandidateMatchingLocked(now, exclude, accountType, "", advanceRR, false, func(a *Account) bool {
 			return isManagedCodexAPIKeyAccount(a)
 		})
 	}
-	return p.selectEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, advanceRR, nil)
+	return p.selectEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, advanceRR, false, nil)
 }
 
-func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude map[string]bool, accountType AccountType, requiredPlan string, advanceRR bool, include func(*Account) bool) *Account {
+func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude map[string]bool, accountType AccountType, requiredPlan string, advanceRR bool, stableOrder bool, include func(*Account) bool) *Account {
 	n := len(p.accounts)
 	if n == 0 {
 		return nil
@@ -1540,10 +1810,43 @@ func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude
 		tier         int
 		secondaryPct float64
 		score        float64
+		inflight     int64
+		lastUsed     time.Time
+		gitLabClaude bool
 	}
 	var eligible []scoredAccount
+	stableCodexTieBreak := accountType == AccountTypeCodex
+	betterScoredAccount := func(candidate, incumbent *scoredAccount) bool {
+		if candidate == nil {
+			return false
+		}
+		if incumbent == nil {
+			return true
+		}
+		if accountType == AccountTypeClaude && candidate.gitLabClaude && incumbent.gitLabClaude {
+			if candidate.inflight != incumbent.inflight {
+				return candidate.inflight < incumbent.inflight
+			}
+			if candidate.lastUsed.IsZero() != incumbent.lastUsed.IsZero() {
+				return candidate.lastUsed.IsZero()
+			}
+			if !candidate.lastUsed.Equal(incumbent.lastUsed) {
+				return candidate.lastUsed.Before(incumbent.lastUsed)
+			}
+		}
+		if candidate.score != incumbent.score {
+			return candidate.score > incumbent.score
+		}
+		if !stableCodexTieBreak {
+			return false
+		}
+		return strings.Compare(candidate.acc.ID, incumbent.acc.ID) < 0
+	}
 
-	start := int(p.rr % uint64(n))
+	start := 0
+	if !stableOrder {
+		start = int(p.rr % uint64(n))
+	}
 	for i := 0; i < n; i++ {
 		a := p.accounts[(start+i)%n]
 		if include != nil && !include(a) {
@@ -1571,13 +1874,51 @@ func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude
 			log.Printf("ignoring rate limit for codex account %s (until %s)", a.ID, a.RateLimitUntil.Format(time.RFC3339))
 		}
 		tier := accountTier(a.Type, a.PlanType)
+		lastUsed := a.LastUsed
+		gitLabClaude := isGitLabClaudeAccount(a)
 		score := scoreAccountLocked(a, now)
 		a.mu.Unlock()
-		score -= float64(atomic.LoadInt64(&a.Inflight)) * 0.02
-		eligible = append(eligible, scoredAccount{acc: a, tier: tier, secondaryPct: routing.SecondaryUsed, score: score})
+		inflight := atomic.LoadInt64(&a.Inflight)
+		score -= float64(inflight) * 0.02
+		eligible = append(eligible, scoredAccount{
+			acc:          a,
+			tier:         tier,
+			secondaryPct: routing.SecondaryUsed,
+			score:        score,
+			inflight:     inflight,
+			lastUsed:     lastUsed,
+			gitLabClaude: gitLabClaude,
+		})
 	}
 
 	if len(eligible) == 0 {
+		return nil
+	}
+
+	if accountType == AccountTypeCodex {
+		bestTier := 0
+		for i := range eligible {
+			sa := &eligible[i]
+			if bestTier == 0 || sa.tier < bestTier {
+				bestTier = sa.tier
+			}
+		}
+		var bestTierSeat *scoredAccount
+		for i := range eligible {
+			sa := &eligible[i]
+			if sa.tier != bestTier {
+				continue
+			}
+			if bestTierSeat == nil || betterScoredAccount(sa, bestTierSeat) {
+				bestTierSeat = sa
+			}
+		}
+		if bestTierSeat != nil {
+			if advanceRR && !stableOrder {
+				p.rr++
+			}
+			return bestTierSeat.acc
+		}
 		return nil
 	}
 
@@ -1587,13 +1928,13 @@ func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude
 	for i := range eligible {
 		sa := &eligible[i]
 		if sa.tier == 1 && sa.secondaryPct < threshold {
-			if bestTier1 == nil || sa.score > bestTier1.score {
+			if bestTier1 == nil || betterScoredAccount(sa, bestTier1) {
 				bestTier1 = sa
 			}
 		}
 	}
 	if bestTier1 != nil {
-		if advanceRR {
+		if advanceRR && !stableOrder {
 			p.rr++
 		}
 		return bestTier1.acc
@@ -1603,13 +1944,13 @@ func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude
 	for i := range eligible {
 		sa := &eligible[i]
 		if sa.tier == 2 && sa.secondaryPct < threshold {
-			if bestTier2 == nil || sa.score > bestTier2.score {
+			if bestTier2 == nil || betterScoredAccount(sa, bestTier2) {
 				bestTier2 = sa
 			}
 		}
 	}
 	if bestTier2 != nil {
-		if advanceRR {
+		if advanceRR && !stableOrder {
 			p.rr++
 		}
 		return bestTier2.acc
@@ -1618,12 +1959,12 @@ func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude
 	var bestAll *scoredAccount
 	for i := range eligible {
 		sa := &eligible[i]
-		if bestAll == nil || sa.score > bestAll.score {
+		if bestAll == nil || betterScoredAccount(sa, bestAll) {
 			bestAll = sa
 		}
 	}
 	if bestAll != nil {
-		if advanceRR {
+		if advanceRR && !stableOrder {
 			p.rr++
 		}
 		return bestAll.acc
@@ -1820,6 +2161,10 @@ func saveAccount(a *Account) error {
 }
 
 func saveCodexAccount(a *Account) error {
+	if isGitLabCodexAccount(a) {
+		return saveGitLabCodexAccount(a)
+	}
+
 	// Preserve ALL fields in the original auth.json by modifying only token fields that
 	// refresh updates. If we can't parse the existing file, fail closed to avoid
 	// clobbering user-provided auth.json content.
@@ -1900,6 +2245,11 @@ func saveCodexAccount(a *Account) error {
 	if !a.LastRefresh.IsZero() {
 		root["last_refresh"] = a.LastRefresh.UTC().Format(time.RFC3339Nano)
 	}
+
+	setJSONField(root, "health_status", strings.TrimSpace(a.HealthStatus), strings.TrimSpace(a.HealthStatus) != "")
+	setJSONField(root, "health_error", strings.TrimSpace(a.HealthError), strings.TrimSpace(a.HealthError) != "")
+	setJSONTimeField(root, "health_checked_at", a.HealthCheckedAt)
+	setJSONTimeField(root, "last_healthy_at", a.LastHealthyAt)
 
 	// Persist dead flag so accounts stay dead across restarts
 	if a.Dead {
@@ -1992,10 +2342,12 @@ func saveGeminiAccount(a *Account) error {
 	geminiProtectedModels := normalizeStringSlice(a.GeminiProtectedModels)
 	geminiQuotaModels := cloneGeminiModelQuotaSnapshots(a.GeminiQuotaModels)
 	geminiModelForwardingRules := cloneStringMap(a.GeminiModelForwardingRules)
+	geminiModelRateLimitResetTimes := normalizeGeminiModelRateLimitResetTimes(a.GeminiModelRateLimitResetTimes, time.Now().UTC())
 	setJSONField(root, "gemini_protected_models", geminiProtectedModels, len(geminiProtectedModels) > 0)
 	setJSONField(root, "gemini_quota_models", geminiQuotaModels, len(geminiQuotaModels) > 0)
 	setJSONTimeField(root, "gemini_quota_updated_at", a.GeminiQuotaUpdatedAt)
 	setJSONField(root, "gemini_model_forwarding_rules", geminiModelForwardingRules, len(geminiModelForwardingRules) > 0)
+	setJSONField(root, "gemini_model_rate_limit_reset_times", geminiModelRateLimitResetTimes, len(geminiModelRateLimitResetTimes) > 0)
 	if !a.ExpiresAt.IsZero() {
 		root["expiry_date"] = a.ExpiresAt.UnixMilli()
 	}

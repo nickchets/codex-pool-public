@@ -36,6 +36,7 @@ type StatusData struct {
 	Accounts             []AccountStatus               `json:"accounts"`
 	TokenAnalytics       *TokenAnalytics               `json:"token_analytics,omitempty"`
 	PoolUtilization      []PoolUtilization             `json:"pool_utilization,omitempty"`
+	CodexForcedPlan      string                        `json:"codex_forced_plan,omitempty"`
 	LocalOperatorEnabled bool                          `json:"-"`
 }
 
@@ -124,6 +125,7 @@ type GeminiProviderTruthStatus struct {
 	QuotaForbidden       bool                       `json:"quota_forbidden,omitempty"`
 	QuotaForbiddenReason string                     `json:"quota_forbidden_reason,omitempty"`
 	ProtectedModels      []string                   `json:"protected_models,omitempty"`
+	RateLimitResetTimes  map[string]string          `json:"rate_limit_reset_times,omitempty"`
 	Quota                *GeminiProviderQuotaStatus `json:"quota,omitempty"`
 }
 
@@ -195,7 +197,7 @@ func geminiOperatorSourceLabel(source string) string {
 	case geminiOperatorSourceManualImport, geminiOperatorSourceManualImportLegacy:
 		return "legacy local import"
 	case geminiOperatorSourceAntigravityImport:
-		return "antigravity browser auth"
+		return "Gemini Browser Auth"
 	default:
 		return ""
 	}
@@ -238,6 +240,18 @@ func managedOpenAIAPIProbeSummary(snapshot accountSnapshot, now time.Time) strin
 	}
 }
 
+func displayAccountHealthStatus(snapshot accountSnapshot, routing routingState) string {
+	healthStatus := strings.TrimSpace(snapshot.HealthStatus)
+	if snapshot.Type != AccountTypeGemini || snapshot.Dead || snapshot.Disabled {
+		return healthStatus
+	}
+	if strings.TrimSpace(snapshot.GeminiOperationalState) == geminiOperationalTruthStateCooldown ||
+		strings.TrimSpace(routing.BlockReason) == "rate_limited" {
+		return geminiOperationalTruthStateCooldown
+	}
+	return healthStatus
+}
+
 func managedOpenAIAPIPoolStatusNote(pool OpenAIAPIPoolStatus) string {
 	if pool.TotalKeys == 0 {
 		return ""
@@ -250,7 +264,7 @@ func managedOpenAIAPIPoolStatusNote(pool OpenAIAPIPoolStatus) string {
 }
 
 func geminiOperatorStatusNote(status GeminiOperatorStatus) string {
-	parts := []string{"Antigravity browser auth is the only supported Gemini seat onboarding flow for this pool."}
+	parts := []string{"Gemini Browser Auth is the only supported Gemini seat onboarding flow for this pool."}
 	if status.LegacySeatCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d legacy local Gemini seat(s) still remain in the pool.", status.LegacySeatCount))
 	}
@@ -441,7 +455,8 @@ func geminiQuotaModelRuntimeSupportForSnapshot(snapshot accountSnapshot, routePr
 	switch routeProvider {
 	case "gemini":
 		if (!snapshot.AntigravityProxyDisabled && !snapshot.AntigravityQuotaForbidden && snapshot.GeminiProviderTruthReady && !snapshot.AntigravityValidationBlocked) ||
-			canRouteValidationBlockedAntigravityGeminiSnapshot(snapshot) {
+			canRouteValidationBlockedAntigravityGeminiSnapshot(snapshot) ||
+			(effectiveGeminiCodeAssistProjectIDForSnapshot(snapshot) != "" && geminiHasOperationalProof(snapshot.GeminiOperationalState)) {
 			return geminiQuotaModelRuntimeSupport{
 				Routable:          true,
 				CompatibilityLane: geminiQuotaCompatibilityLaneGeminiFacade,
@@ -656,6 +671,51 @@ func geminiOperationalTruthStatus(snapshot accountSnapshot) *GeminiOperationalTr
 	return status
 }
 
+func compactGeminiCooldownReason(snapshot accountSnapshot, now time.Time) string {
+	resetTimes := normalizeGeminiModelRateLimitResetTimes(snapshot.GeminiModelRateLimitResetTimes, now)
+	if len(resetTimes) == 0 {
+		return ""
+	}
+	type cooldownRow struct {
+		model string
+		at    time.Time
+	}
+	rows := make([]cooldownRow, 0, len(resetTimes))
+	for model, resetAt := range resetTimes {
+		if model == "" || resetAt.IsZero() || !resetAt.After(now) {
+			continue
+		}
+		rows = append(rows, cooldownRow{model: model, at: resetAt.UTC()})
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].at.Equal(rows[j].at) {
+			return rows[i].model < rows[j].model
+		}
+		return rows[i].at.Before(rows[j].at)
+	})
+	if len(rows) == 1 {
+		return fmt.Sprintf("model cooldown active: %s until %s", rows[0].model, rows[0].at.Format(time.RFC3339))
+	}
+	return fmt.Sprintf("%d model cooldowns active; next reset %s for %s", len(rows), rows[0].at.Format(time.RFC3339), rows[0].model)
+}
+
+func compactGeminiEligibleDegradedReason(snapshot accountSnapshot, now time.Time) string {
+	if strings.TrimSpace(snapshot.GeminiOperationalState) == geminiOperationalTruthStateCooldown {
+		if reason := compactGeminiCooldownReason(snapshot, now); reason != "" {
+			return reason
+		}
+	}
+	if strings.TrimSpace(snapshot.GeminiProviderTruthState) == geminiProviderTruthStateMissingProjectID &&
+		effectiveGeminiCodeAssistProjectIDForSnapshot(snapshot) != "" &&
+		geminiHasOperationalProof(snapshot.GeminiOperationalState) {
+		return "fallback project in use; provider truth missing project_id"
+	}
+	return ""
+}
+
 func geminiRoutingDisplay(snapshot accountSnapshot, routing routingState, now time.Time) (string, string) {
 	if snapshot.Type != AccountTypeGemini {
 		if routing.Eligible {
@@ -672,15 +732,23 @@ func geminiRoutingDisplay(snapshot accountSnapshot, routing routingState, now ti
 		case geminiOperationalTruthStateHardFail:
 			return routingDisplayStateDegradedEnabled, sanitizeStatusMessage(firstNonEmpty(snapshot.GeminiOperationalReason, "last Gemini smoke failed"))
 		case geminiOperationalTruthStateCooldown:
-			return routingDisplayStateDegradedEnabled, sanitizeStatusMessage(firstNonEmpty(snapshot.GeminiOperationalReason, "last Gemini proof is still cooling down"))
+			return routingDisplayStateDegradedEnabled, sanitizeStatusMessage(firstNonEmpty(
+				compactGeminiEligibleDegradedReason(snapshot, now),
+				snapshot.GeminiOperationalReason,
+				"last Gemini proof is still cooling down",
+			))
 		case geminiOperationalTruthStateDegradedOK:
-			return routingDisplayStateDegradedEnabled, sanitizeStatusMessage(snapshot.GeminiOperationalReason)
+			return routingDisplayStateDegradedEnabled, sanitizeStatusMessage(firstNonEmpty(
+				compactGeminiEligibleDegradedReason(snapshot, now),
+				snapshot.GeminiOperationalReason,
+			))
 		}
 		switch strings.TrimSpace(snapshot.GeminiProviderTruthState) {
 		case "", geminiProviderTruthStateReady:
 			return routingDisplayStateEnabled, ""
 		default:
 			return routingDisplayStateDegradedEnabled, sanitizeStatusMessage(firstNonEmpty(
+				compactGeminiEligibleDegradedReason(snapshot, now),
 				snapshot.GeminiOperationalReason,
 				snapshot.GeminiProviderTruthReason,
 				geminiValidationReasonSummary(snapshot.GeminiValidationReasonCode, snapshot.GeminiValidationMessage, snapshot.GeminiValidationURL, snapshot.GeminiProviderTruthState),
@@ -821,6 +889,7 @@ func (h *proxyHandler) buildPoolDashboardData(now time.Time) StatusData {
 		GeneratedAt: now,
 		Uptime:      now.Sub(h.startTime),
 	}
+	data.CodexForcedPlan = strings.TrimSpace(h.cfg.forceCodexRequiredPlan)
 
 	if h.poolUsers != nil {
 		data.PoolUsers = len(h.poolUsers.List())
@@ -1038,6 +1107,7 @@ func (h *proxyHandler) buildPoolDashboardData(now time.Time) StatusData {
 				QuotaForbidden:       snapshot.AntigravityQuotaForbidden,
 				QuotaForbiddenReason: sanitizeStatusMessage(snapshot.AntigravityQuotaForbiddenReason),
 				ProtectedModels:      protectedModels,
+				RateLimitResetTimes:  formatGeminiModelRateLimitResetTimes(snapshot.GeminiModelRateLimitResetTimes, now),
 				Quota:                quotaStatus,
 			}
 			if !snapshot.GeminiProviderCheckedAt.IsZero() {
@@ -1064,7 +1134,7 @@ func (h *proxyHandler) buildPoolDashboardData(now time.Time) StatusData {
 		if !snapshot.DeadSince.IsZero() {
 			status.DeadSince = snapshot.DeadSince.UTC().Format(time.RFC3339)
 		}
-		status.HealthStatus = strings.TrimSpace(snapshot.HealthStatus)
+		status.HealthStatus = displayAccountHealthStatus(snapshot, routing)
 		status.HealthError = sanitizeStatusMessage(snapshot.HealthError)
 		status.Penalty = snapshot.Penalty
 		if snapshot.FallbackOnly {
@@ -1388,6 +1458,32 @@ func (h *proxyHandler) serveStatusPage(w http.ResponseWriter, r *http.Request) {
 		"score": func(v float64) string {
 			return fmt.Sprintf("%.2f", v)
 		},
+		"quotaStateLabel": func(routable bool, lane, routeProvider string) string {
+			routeProvider = strings.TrimSpace(routeProvider)
+			if routable {
+				return "routable"
+			}
+			if strings.TrimSpace(lane) == geminiQuotaCompatibilityLaneAnthropicAdapterRequired {
+				return "catalog-only"
+			}
+			if routeProvider != "" && routeProvider != "gemini" {
+				return "unsupported-provider"
+			}
+			return "seat-blocked"
+		},
+		"quotaStateTagClass": func(routable bool, lane, routeProvider string) string {
+			routeProvider = strings.TrimSpace(routeProvider)
+			if routable {
+				return "tag tag-state-routable"
+			}
+			if strings.TrimSpace(lane) == geminiQuotaCompatibilityLaneAnthropicAdapterRequired {
+				return "tag tag-state-catalog"
+			}
+			if routeProvider != "" && routeProvider != "gemini" {
+				return "tag tag-state-unknown"
+			}
+			return "tag tag-state-seat-blocked"
+		},
 		"bar": func(v float64) template.HTML {
 			width := v
 			if width > 100 {
@@ -1517,7 +1613,7 @@ func formatTokenCount(n int64) string {
 const statusHTML = `<!DOCTYPE html>
 <html>
 <head>
-    <title>Pool Status</title>
+    <title>Pool Diagnostics</title>
     <meta http-equiv="refresh" content="30">
     <style>
         body {
@@ -1688,12 +1784,50 @@ const statusHTML = `<!DOCTYPE html>
         .tag-api { background: #1f6feb; color: #fff; }
         .tag-disabled { background: #6e7681; color: #fff; }
         .tag-dead { background: #f85149; color: #fff; }
+        .tag-state-routable { background: #238636; color: #fff; }
+        .tag-state-seat-blocked { background: #d29922; color: #111; }
+        .tag-state-catalog { background: #6e7681; color: #fff; }
+        .tag-state-unknown { background: #30363d; color: #fff; }
+        .tag-capability { background: #1f6feb; color: #fff; }
+        .tag-capability-thinking { background: #8957e5; color: #fff; }
         .usage-cell { white-space: nowrap; }
         .detail-line {
             display: block;
             max-width: 340px;
             white-space: normal;
             overflow-wrap: anywhere;
+        }
+        .quota-model-list {
+            margin-top: 8px;
+            display: grid;
+            gap: 8px;
+        }
+        .quota-model-row {
+            background: #0d1117;
+            border: 1px solid #21262d;
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+        .quota-model-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 10px;
+        }
+        .quota-model-name {
+            font-weight: 600;
+            color: #dbeafe;
+        }
+        .quota-model-meter {
+            color: #58a6ff;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .quota-model-tags {
+            margin-top: 6px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
         }
         .effective { color: #8b949e; font-size: 11px; }
         .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
@@ -1702,152 +1836,31 @@ const statusHTML = `<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>🏊 Pool Status</h1>
+    <h1>🧪 Pool Diagnostics</h1>
     <div class="meta">
         Generated: {{.GeneratedAt.Format "2006-01-02 15:04:05"}} · Uptime: {{.Uptime.Round 1000000000}}
     </div>
-    {{if or .LocalOperatorEnabled (gt .TotalCount 0)}}
-    <div class="toolbar">
-        {{if .LocalOperatorEnabled}}
-        <div class="operator-card">
-            <div class="operator-title">Operator Action</div>
-            <div class="muted">
-                Starts the same browser-based OAuth flow exposed by <code>POST /operator/codex/oauth-start</code>, keeps the popup opener attached, and refreshes this page automatically when pool seat state changes.
-            </div>
-            <button id="codex-oauth-start-btn" class="action-btn" onclick="startCodexOAuthFromStatus()">Start Codex OAuth</button>
-            <div id="codex-oauth-start-status" class="muted" style="margin-top: 10px;"></div>
-            <div id="codex-oauth-start-result" class="result-block" style="display: none;">
-                <div class="muted" style="margin-bottom: 8px;">OAuth URL</div>
-                <div id="codex-oauth-start-url" class="mono" style="word-break: break-all;"></div>
-                <div id="codex-oauth-start-outcome" class="muted" style="margin-top: 10px;"></div>
-                <a id="codex-oauth-start-open" href="#" target="_blank" style="display: inline-block; margin-top: 10px;">Open OAuth Page</a>
-            </div>
+    <div class="operator-card" style="margin-bottom: 20px;">
+        <div class="operator-title">Diagnostics Surface</div>
+        <div class="muted">
+            This page is intentionally read-only and diagnostic-heavy. Use the tabbed landing page at <a href="/">/</a> for provider onboarding, operator actions, and day-to-day pool control.
         </div>
-        <div class="operator-card">
-            <div class="operator-title">Fallback API Pool</div>
-            <div class="muted">
-                These OpenAI API keys are used only when all Codex subscription seats are unavailable. Each added key is stored locally and probed with a minimal <code>/v1/responses</code> health check so quota/auth failures show up before the pool has to rely on it.
-            </div>
-            <div class="result-block">
-                <div><strong>Keys:</strong> {{.OpenAIAPIPool.TotalKeys}}</div>
-                <div><strong>Last probe healthy:</strong> {{.OpenAIAPIPool.HealthyKeys}}</div>
-                <div><strong>Eligible now:</strong> {{.OpenAIAPIPool.EligibleKeys}}</div>
-                {{if .OpenAIAPIPool.EligibleUnhealthyKeys}}<div><strong>Eligible without fresh healthy probe:</strong> {{.OpenAIAPIPool.EligibleUnhealthyKeys}}</div>{{end}}
-                {{if .OpenAIAPIPool.NextKeyID}}<div><strong>Next fallback key:</strong> <span class="mono" title="{{.OpenAIAPIPool.NextKeyID}}">{{clip .OpenAIAPIPool.NextKeyID 24}}</span></div>{{end}}
-            </div>
-            {{if .OpenAIAPIPool.StatusNote}}<div class="muted" style="margin-top: 10px;">{{.OpenAIAPIPool.StatusNote}}</div>{{end}}
-            <div class="action-row">
-                <input id="openai-api-key-input" class="action-input mono" type="password" autocomplete="off" spellcheck="false" placeholder="sk-proj-..." />
-                <button id="openai-api-key-add-btn" class="action-btn" onclick="addOpenAIApiKeyFromStatus()">Add API Key</button>
-            </div>
-            <div id="openai-api-key-add-status" class="muted" style="margin-top: 10px;"></div>
+        <div class="result-block">
+            <a href="/">Return to Dashboard</a> ·
+            <a href="/status?format=json">Status JSON</a> ·
+            <a href="/healthz">Health check</a>
         </div>
-        <div class="operator-card">
-            <div class="operator-title">GitLab Claude Pool</div>
-            <div class="muted">
-                These GitLab tokens mint short-lived Duo direct-access credentials for Claude through GitLab's Anthropic-compatible gateway. Store a PAT or OAuth access token; the pool refreshes gateway headers/tokens automatically and keeps Claude Code pointed at this same local proxy.
-            </div>
-            <div class="result-block">
-                <div><strong>Tokens:</strong> {{.GitLabClaudePool.TotalTokens}}</div>
-                <div><strong>Healthy:</strong> {{.GitLabClaudePool.HealthyTokens}}</div>
-                <div><strong>Eligible now:</strong> {{.GitLabClaudePool.EligibleTokens}}</div>
-                {{if .GitLabClaudePool.NextTokenID}}<div><strong>Next token:</strong> <span class="mono" title="{{.GitLabClaudePool.NextTokenID}}">{{clip .GitLabClaudePool.NextTokenID 24}}</span></div>{{end}}
-            </div>
-            <div class="action-row" style="margin-bottom: 10px;">
-                <input id="gitlab-claude-instance-input" class="action-input mono" type="text" autocomplete="off" spellcheck="false" placeholder="https://gitlab.com" value="https://gitlab.com" />
-            </div>
-            <div class="action-row">
-                <input id="gitlab-claude-token-input" class="action-input mono" type="password" autocomplete="off" spellcheck="false" placeholder="glpat-... or GitLab OAuth token" />
-                <button id="gitlab-claude-token-add-btn" class="action-btn" onclick="addGitLabClaudeTokenFromStatus()">Add GitLab Token</button>
-            </div>
-            <div id="gitlab-claude-token-add-status" class="muted" style="margin-top: 10px;"></div>
+    </div>
+    {{if gt .Quarantine.Total 0}}
+    <div class="operator-card" style="margin-bottom: 20px;">
+        <div class="operator-title">Quarantine</div>
+        <div class="muted">
+            Accounts that stay dead for more than 72 hours are moved out of the active pool automatically so they stop inflating routing totals and recovery expectations.
         </div>
-        <div class="operator-card">
-            <div class="operator-title">Antigravity Gemini Auth</div>
-            <div class="muted">
-                This lane mirrors the original Antigravity browser sign-in flow, resolves the Code Assist project automatically, and stores the result as an Antigravity-backed Gemini seat in this pool. Browser auth is the only supported Gemini seat onboarding flow for this pool.
-            </div>
-            <div class="result-block">
-                <div><strong>Antigravity seats:</strong> {{.GeminiOperator.AntigravitySeatCount}}</div>
-                {{if .GeminiOperator.LegacySeatCount}}<div><strong>Legacy local seats:</strong> {{.GeminiOperator.LegacySeatCount}}</div>{{end}}
-                {{if .GeminiOperator.ManagedSeatCount}}<div><strong>Legacy managed seats:</strong> {{.GeminiOperator.ManagedSeatCount}}</div>{{end}}
-                <div><strong>Total Gemini seats:</strong> {{.GeminiCount}}</div>
-            </div>
-            {{if .GeminiOperator.Note}}<div class="muted" style="margin-top: 10px;">{{.GeminiOperator.Note}}</div>{{end}}
-            <div class="action-row">
-                <button id="gemini-oauth-start-btn" class="action-btn" onclick="startGeminiOAuthFromStatus()">Start Antigravity Gemini Auth</button>
-            </div>
-            <div id="gemini-oauth-start-status" class="muted" style="margin-top: 10px;"></div>
-            <div id="gemini-oauth-start-result" class="result-block" style="display: none;">
-                <div><strong>Antigravity Auth URL</strong></div>
-                <div id="gemini-oauth-start-url" class="mono" style="word-break: break-all;"></div>
-                <div id="gemini-oauth-start-outcome" class="muted" style="margin-top: 10px;"></div>
-                <a id="gemini-oauth-start-open" href="#" target="_blank" style="display: inline-block; margin-top: 10px;">Open Antigravity Auth Page</a>
-            </div>
+        <div class="result-block">
+            <div><strong>Quarantined files:</strong> {{.Quarantine.Total}}</div>
+            {{range .Quarantine.Recent}}<div><strong>{{.Provider}}:</strong> <span class="mono">{{clip .ID 24}}</span>{{if .QuarantinedAt}} · {{.QuarantinedAt}}{{end}}</div>{{end}}
         </div>
-        {{if gt .Quarantine.Total 0}}
-        <div class="operator-card">
-            <div class="operator-title">Quarantine</div>
-            <div class="muted">
-                Accounts that stay dead for more than 72 hours are moved out of the active pool automatically so they stop inflating routing totals and recovery expectations.
-            </div>
-            <div class="result-block">
-                <div><strong>Quarantined files:</strong> {{.Quarantine.Total}}</div>
-                {{range .Quarantine.Recent}}<div><strong>{{.Provider}}:</strong> <span class="mono">{{clip .ID 24}}</span>{{if .QuarantinedAt}} · {{.QuarantinedAt}}{{end}}</div>{{end}}
-            </div>
-        </div>
-        {{end}}
-        {{end}}
-        <div class="operator-card seat-card">
-            <div class="operator-title">Current Active Seat</div>
-            {{with .ActiveSeat}}
-            <div style="font-size: 22px; font-weight: 700; color: #dbeafe;">{{.ID}}</div>
-            {{if .Email}}<div class="muted">{{.Email}}</div>{{end}}
-            <div class="muted" style="margin-top: 8px;">{{.Basis}}</div>
-            <div class="result-block">
-                <div><strong>Routing:</strong> {{.RoutingStatus}}</div>
-	                <div><strong>Headroom:</strong> {{headroomPct .PrimaryHeadroomPct .PrimaryHeadroomKnown}} / {{headroomPct .SecondaryHeadroomPct .SecondaryHeadroomKnown}}</div>
-                {{if .WorkspaceID}}<div><strong>Workspace:</strong> <span class="mono" title="{{.WorkspaceID}}">{{clipOpaque .WorkspaceID}}</span></div>{{end}}
-                {{if .SeatKey}}<div><strong>Seat:</strong> <span class="mono" title="{{.SeatKey}}">{{clipOpaque .SeatKey}}</span></div>{{end}}
-                {{if gt .Inflight 0}}<div><strong>Inflight:</strong> {{.Inflight}}</div>{{end}}
-                <div><strong>Last used:</strong> {{.LocalLastUsed}}</div>
-                {{if gt .ActiveSeatCount 1}}<div><strong>Active seats now:</strong> {{.ActiveSeatCount}}</div>{{end}}
-            </div>
-            {{else}}
-            <div style="font-size: 22px; font-weight: 700; color: #dbeafe;">None</div>
-            <div class="muted" style="margin-top: 8px;">No live request is active right now.</div>
-            {{end}}
-        </div>
-        {{with .LastUsedSeat}}
-        <div class="operator-card seat-card">
-            <div class="operator-title">Last Used Seat</div>
-            <div style="font-size: 22px; font-weight: 700; color: #dbeafe;">{{.ID}}</div>
-            {{if .Email}}<div class="muted">{{.Email}}</div>{{end}}
-            <div class="muted" style="margin-top: 8px;">{{.Basis}}</div>
-            <div class="result-block">
-                <div><strong>Routing:</strong> {{.RoutingStatus}}</div>
-	                <div><strong>Headroom:</strong> {{headroomPct .PrimaryHeadroomPct .PrimaryHeadroomKnown}} / {{headroomPct .SecondaryHeadroomPct .SecondaryHeadroomKnown}}</div>
-                {{if .WorkspaceID}}<div><strong>Workspace:</strong> <span class="mono" title="{{.WorkspaceID}}">{{clipOpaque .WorkspaceID}}</span></div>{{end}}
-                {{if .SeatKey}}<div><strong>Seat:</strong> <span class="mono" title="{{.SeatKey}}">{{clipOpaque .SeatKey}}</span></div>{{end}}
-                <div><strong>Last used:</strong> {{.LocalLastUsed}}</div>
-            </div>
-        </div>
-        {{end}}
-        {{with .BestEligibleSeat}}
-        <div class="operator-card seat-card">
-            <div class="operator-title">Next Eligible Seat</div>
-            <div style="font-size: 22px; font-weight: 700; color: #dbeafe;">{{.ID}}</div>
-            {{if .Email}}<div class="muted">{{.Email}}</div>{{end}}
-            <div class="muted" style="margin-top: 8px;">{{.Basis}}</div>
-            <div class="result-block">
-                <div><strong>Routing:</strong> {{.RoutingStatus}}</div>
-	                <div><strong>Headroom:</strong> {{headroomPct .PrimaryHeadroomPct .PrimaryHeadroomKnown}} / {{headroomPct .SecondaryHeadroomPct .SecondaryHeadroomKnown}}</div>
-                {{if .WorkspaceID}}<div><strong>Workspace:</strong> <span class="mono" title="{{.WorkspaceID}}">{{clipOpaque .WorkspaceID}}</span></div>{{end}}
-                {{if .SeatKey}}<div><strong>Seat:</strong> <span class="mono" title="{{.SeatKey}}">{{clipOpaque .SeatKey}}</span></div>{{end}}
-                <div><strong>Last used:</strong> {{.LocalLastUsed}}</div>
-            </div>
-        </div>
-        {{end}}
     </div>
     {{end}}
 
@@ -1971,9 +1984,6 @@ const statusHTML = `<!DOCTYPE html>
     {{end}}
 
     <h2 style="color: #58a6ff; margin-top: 20px; margin-bottom: 10px;">🪑 Seats</h2>
-    {{if .LocalOperatorEnabled}}
-    <div id="account-action-status" class="muted" style="margin: 0 0 12px;"></div>
-    {{end}}
     <div class="table-wrap">
     <table>
         <tr>
@@ -1990,7 +2000,6 @@ const statusHTML = `<!DOCTYPE html>
             <th>Auth TTL</th>
             <th>Local Last Used</th>
             <th>Local Tokens</th>
-            {{if .LocalOperatorEnabled}}<th>Action</th>{{end}}
         </tr>
         {{range .Accounts}}
         <tr>
@@ -2025,10 +2034,50 @@ const statusHTML = `<!DOCTYPE html>
                 {{if .UsageObserved}}<br><small class="detail-line">usage {{.UsageObserved}}</small>{{end}}
                 {{if .GitLabRateLimitName}}<br><small class="detail-line" title="{{.GitLabRateLimitName}}{{if .GitLabRateLimitResetAt}} · reset {{.GitLabRateLimitResetAt}}{{end}}">gitlab api {{.GitLabRateLimitRemaining}}/{{.GitLabRateLimitLimit}}{{if .GitLabRateLimitResetIn}} · resets in {{.GitLabRateLimitResetIn}}{{end}}</small>{{end}}
                 {{if .GitLabQuotaExceededCount}}<br><small class="detail-line">quota backoff ×{{.GitLabQuotaExceededCount}}{{if .GitLabQuotaProbeIn}} · next probe {{.GitLabQuotaProbeIn}}{{end}}</small>{{end}}
-                {{if or .FallbackOnly (eq .PlanType "gitlab_duo") (eq .Type "gemini")}}<br><small class="detail-line" title="{{sanitize .HealthError}}">health {{if .HealthStatus}}{{.HealthStatus}}{{else}}unknown{{end}}{{if .HealthError}} · {{clip (sanitize .HealthError) 88}}{{end}}</small>{{end}}
+                {{if or .HealthStatus .HealthError}}<br><small class="detail-line" title="{{sanitize .HealthError}}">health {{if .HealthStatus}}{{.HealthStatus}}{{else}}unknown{{end}}{{if .HealthError}} · {{clip (sanitize .HealthError) 88}}{{end}}</small>{{end}}
                 {{if and (eq .Type "gemini") .ProviderTruth}}<br><small class="detail-line">provider {{if .ProviderTruth.State}}{{.ProviderTruth.State}}{{else if .ProviderTruth.Ready}}ready{{else}}unknown{{end}}{{if .ProviderTruth.Stale}} · stale{{end}}{{if .ProviderTruth.ProjectID}} · project <span class="mono" title="{{.ProviderTruth.ProjectID}}">{{clipOpaque .ProviderTruth.ProjectID}}</span>{{end}}</small>{{end}}
                 {{if and (eq .Type "gemini") .OperationalTruth}}<br><small class="detail-line">operational {{if .OperationalTruth.State}}{{.OperationalTruth.State}}{{else}}unknown{{end}}{{if .OperationalTruth.Reason}} · {{clip .OperationalTruth.Reason 88}}{{end}}{{if .OperationalTruth.CheckedAt}} · checked {{.OperationalTruth.CheckedAt}}{{end}}</small>{{end}}
                 {{if and (eq .Type "gemini") .ProviderQuotaSummary}}<br><small class="detail-line">quota {{.ProviderQuotaSummary}}</small>{{end}}
+                {{if and (eq .Type "gemini") .ProviderTruth .ProviderTruth.Quota}}
+                    {{with .ProviderTruth.Quota}}
+                        {{if gt (len .Models) 0}}
+                        <div class="quota-model-list">
+                            {{range .Models}}
+                            <div class="quota-model-row">
+                                <div class="quota-model-head">
+                                    <span class="quota-model-name">{{if .DisplayName}}{{.DisplayName}}{{else}}{{.Name}}{{end}}</span>
+                                    <span class="quota-model-meter">{{.Percentage}}%</span>
+                                </div>
+                                {{if and .DisplayName (ne .DisplayName .Name)}}<small class="detail-line mono">{{.Name}}</small>{{else if .Name}}<small class="detail-line mono">{{.Name}}</small>{{end}}
+                                <small class="detail-line">
+                                    {{if .ResetTime}}reset {{.ResetTime}}{{end}}
+                                    {{if .CompatibilityReason}}{{if .ResetTime}} · {{end}}{{clip .CompatibilityReason 88}}{{end}}
+                                </small>
+                                {{if or (gt .MaxTokens 0) (gt .MaxOutputTokens 0) (gt .ThinkingBudget 0)}}
+                                <small class="detail-line">
+                                    {{if gt .MaxTokens 0}}max {{printf "%d" .MaxTokens}}{{end}}
+                                    {{if and (gt .MaxTokens 0) (gt .MaxOutputTokens 0)}} · {{end}}
+                                    {{if gt .MaxOutputTokens 0}}max out {{printf "%d" .MaxOutputTokens}}{{end}}
+                                    {{if and (or (gt .MaxTokens 0) (gt .MaxOutputTokens 0)) (gt .ThinkingBudget 0)}} · {{end}}
+                                    {{if gt .ThinkingBudget 0}}thinking {{printf "%d" .ThinkingBudget}}{{end}}
+                                </small>
+                                {{end}}
+                                <div class="quota-model-tags">
+                                    {{if eq .RouteProvider "gemini"}}<span class="tag tag-gemini">gemini</span>{{end}}
+                                    {{if eq .RouteProvider "claude"}}<span class="tag tag-claude">claude</span>{{end}}
+                                    {{if and .RouteProvider (ne .RouteProvider "gemini") (ne .RouteProvider "claude")}}<span class="tag tag-state-unknown">{{.RouteProvider}}</span>{{end}}
+                                    <span class="{{quotaStateTagClass .Routable .CompatibilityLane .RouteProvider}}">{{quotaStateLabel .Routable .CompatibilityLane .RouteProvider}}</span>
+                                    {{if .Protected}}<span class="tag tag-disabled">protected</span>{{end}}
+                                    {{if .Recommended}}<span class="tag tag-pro">recommended</span>{{end}}
+                                    {{if .SupportsImages}}<span class="tag tag-capability">images</span>{{end}}
+                                    {{if .SupportsThinking}}<span class="tag tag-capability-thinking">thinking</span>{{end}}
+                                </div>
+                            </div>
+                            {{end}}
+                        </div>
+                        {{end}}
+                    {{end}}
+                {{end}}
                 {{if .ProbeSummary}}<br><small class="detail-line">{{.ProbeSummary}}</small>{{end}}
                 {{if and .FallbackOnly (gt .Penalty 0)}}<br><small class="detail-line">penalty {{printf "%.2f" .Penalty}}</small>{{end}}
                 {{if .DeadSince}}<br><small class="detail-line">dead since {{.DeadSince}}</small>{{end}}
@@ -2052,18 +2101,6 @@ const statusHTML = `<!DOCTYPE html>
             <td>{{if .AuthExpiresIn}}{{.AuthExpiresIn}}{{else if .FallbackOnly}}managed key{{else}}—{{end}}</td>
             <td>{{.LocalLastUsed}}</td>
             <td>{{.LocalTokens}}</td>
-            {{if $.LocalOperatorEnabled}}
-            <td>
-                <button
-                    class="action-btn danger-btn row-action-btn"
-                    data-account-id="{{.ID}}"
-                    data-account-label="{{if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}"
-                    data-account-kind="{{if .FallbackOnly}}API key{{else}}account{{end}}"
-                    onclick="deleteAccountFromStatus(this)">
-                    {{if .FallbackOnly}}Delete Key{{else}}Delete{{end}}
-                </button>
-            </td>
-            {{end}}
         </tr>
         {{end}}
     </table>
@@ -2131,847 +2168,9 @@ const statusHTML = `<!DOCTYPE html>
         are local proxy/runtime fields, not external quota consumption.
         "Effective" usage shows the weighted value used for load balancing.
         <br>
+        <a href="/">Return to Dashboard</a> ·
         <a href="/status?format=json">Status JSON</a> ·
         <a href="/healthz">Health check</a>
     </p>
-    {{if .LocalOperatorEnabled}}
-    <script>
-        const codexOAuthStatusKey = 'codex-oauth-status-snapshot';
-        const geminiOAuthStatusKey = 'gemini-oauth-status-snapshot';
-        let codexOAuthPopup = null;
-        let codexOAuthWatcher = null;
-        let geminiOAuthPopup = null;
-        let geminiOAuthWatcher = null;
-        let geminiOAuthDone = false;
-        let geminiOAuthMessageBound = false;
-
-        function codexOAuthSnapshot(accounts) {
-            const rows = Array.isArray(accounts) ? accounts : [];
-            const codexRows = rows
-                .filter((acc) => acc && acc.type === 'codex')
-                .map((acc) => [
-                    String(acc.id || ''),
-                    String(acc.type || ''),
-                    String(acc.account_id || ''),
-                    String(acc.workspace_id || ''),
-                    String(acc.seat_key || ''),
-                    String(acc.last_refresh_at || ''),
-                    String(acc.auth_expires_at || ''),
-                    String(!!acc.disabled),
-                    String(!!acc.dead),
-                ].join('|'))
-                .sort();
-
-            return {
-                count: codexRows.length,
-                signature: codexRows.join('\n'),
-            };
-        }
-
-        function codexOAuthDescribeOutcome(before, after, backendMode) {
-            const mode = String(backendMode || '').trim().toLowerCase();
-            if (mode === 'added') {
-                return 'OAuth completed. Added a new account; refreshing status now.';
-            }
-            if (mode === 'refreshed') {
-                return 'OAuth completed. Refreshed an existing seat; refreshing status now.';
-            }
-            if (after.count > before.count) {
-                return 'OAuth completed. Added a new account; refreshing status now.';
-            }
-            if (after.signature !== before.signature) {
-                return 'OAuth completed. Refreshed an existing seat; refreshing status now.';
-            }
-            return 'OAuth completed. Refreshing status now.';
-        }
-
-        async function codexOAuthFetchStatusSnapshot() {
-            const response = await fetch('/status?format=json', {
-                headers: { 'Accept': 'application/json' }
-            });
-            if (!response.ok) {
-                throw new Error(await response.text());
-            }
-            return response.json();
-        }
-
-        function codexOAuthReadPendingState() {
-            try {
-                const raw = sessionStorage.getItem(codexOAuthStatusKey);
-                return raw ? JSON.parse(raw) : null;
-            } catch (error) {
-                return null;
-            }
-        }
-
-        function codexOAuthClearPendingState() {
-            try {
-                sessionStorage.removeItem(codexOAuthStatusKey);
-            } catch (error) {
-                // Ignore storage errors.
-            }
-        }
-
-        function codexOAuthSetOutcome(message) {
-            const outcome = document.getElementById('codex-oauth-start-outcome');
-            if (outcome) {
-                outcome.textContent = message;
-            }
-        }
-
-        function codexOAuthPreparePopup() {
-            const popup = window.open('', 'codex-oauth-popup');
-            if (!popup) {
-                return null;
-            }
-            try {
-                popup.document.open();
-                popup.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Preparing Codex OAuth</title></head><body style="font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px;"><div style="max-width: 640px; margin: 64px auto; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 24px;">Opening OAuth session...</div></body></html>');
-                popup.document.close();
-                popup.focus();
-            } catch (error) {
-                // Ignore document writes that fail on hardened browsers.
-            }
-            return popup;
-        }
-
-        function codexOAuthStopWatcher() {
-            if (codexOAuthWatcher !== null) {
-                window.clearTimeout(codexOAuthWatcher);
-                codexOAuthWatcher = null;
-            }
-            codexOAuthPopup = null;
-        }
-
-        async function codexOAuthFinalize(beforeSnapshot, backendMode) {
-            const button = document.getElementById('codex-oauth-start-btn');
-            const status = document.getElementById('codex-oauth-start-status');
-            const result = document.getElementById('codex-oauth-start-result');
-            codexOAuthStopWatcher();
-
-            try {
-                const afterSnapshot = codexOAuthSnapshot((await codexOAuthFetchStatusSnapshot()).accounts);
-                const message = codexOAuthDescribeOutcome(beforeSnapshot, afterSnapshot, backendMode);
-                if (status) {
-                    status.style.color = '#3fb950';
-                    status.textContent = message;
-                }
-                codexOAuthSetOutcome(message);
-                codexOAuthClearPendingState();
-                window.setTimeout(() => {
-                    if (button) {
-                        button.disabled = false;
-                    }
-                    if (result) {
-                        result.style.display = 'block';
-                    }
-                    window.location.reload();
-                }, 850);
-            } catch (error) {
-                if (button) {
-                    button.disabled = false;
-                }
-                if (status) {
-                    status.style.color = '#f85149';
-                    status.textContent = 'OAuth completed, but status refresh failed: ' + (error && error.message ? error.message : error);
-                }
-                codexOAuthSetOutcome('Refresh failed. Use the Open OAuth Page link or reload manually.');
-                codexOAuthClearPendingState();
-            }
-        }
-
-        function codexOAuthSnapshotsEqual(beforeSnapshot, afterSnapshot) {
-            return beforeSnapshot.count === afterSnapshot.count && beforeSnapshot.signature === afterSnapshot.signature;
-        }
-
-        function codexOAuthWatchStatusChange(beforeSnapshot, backendMode) {
-            const status = document.getElementById('codex-oauth-start-status');
-            let attempts = 0;
-            const maxAttempts = 150;
-            const tick = async () => {
-                if (codexOAuthWatcher === null) {
-                    return;
-                }
-                attempts += 1;
-                try {
-                    const afterSnapshot = codexOAuthSnapshot((await codexOAuthFetchStatusSnapshot()).accounts);
-                    if (!codexOAuthSnapshotsEqual(beforeSnapshot, afterSnapshot)) {
-                        if (status) {
-                            status.style.color = '#3fb950';
-                            status.textContent = 'OAuth callback applied. Refreshing status now.';
-                        }
-                        void codexOAuthFinalize(beforeSnapshot, backendMode);
-                        return;
-                    }
-                    if (status) {
-                        status.style.color = '#8b949e';
-                        status.textContent = 'Waiting for pool seat state to change...';
-                    }
-                } catch (error) {
-                    if (status) {
-                        status.style.color = '#8b949e';
-                        status.textContent = 'Waiting for pool seat state to change...';
-                    }
-                }
-                if (attempts >= maxAttempts) {
-                    codexOAuthStopWatcher();
-                    if (status) {
-                        status.style.color = '#f85149';
-                        status.textContent = 'Timed out waiting for pool seat state to change. Use the Open OAuth Page link to retry.';
-                    }
-                    codexOAuthSetOutcome('No pool seat state change was detected.');
-                    const button = document.getElementById('codex-oauth-start-btn');
-                    if (button) {
-                        button.disabled = false;
-                    }
-                    return;
-                }
-                codexOAuthWatcher = window.setTimeout(tick, 2000);
-            };
-            if (status) {
-                status.style.color = '#8b949e';
-                status.textContent = 'Waiting for pool seat state to change...';
-            }
-            codexOAuthWatcher = window.setTimeout(tick, 2000);
-        }
-
-        async function startCodexOAuthFromStatus() {
-            const button = document.getElementById('codex-oauth-start-btn');
-            const status = document.getElementById('codex-oauth-start-status');
-            const result = document.getElementById('codex-oauth-start-result');
-            const urlNode = document.getElementById('codex-oauth-start-url');
-            const openLink = document.getElementById('codex-oauth-start-open');
-            const outcome = document.getElementById('codex-oauth-start-outcome');
-
-            if (!button || !status || !result || !urlNode || !openLink) {
-                return;
-            }
-
-            button.disabled = true;
-            status.style.color = '#8b949e';
-            status.textContent = 'Starting OAuth session...';
-            result.style.display = 'none';
-            urlNode.textContent = '';
-            openLink.href = '#';
-            if (outcome) {
-                outcome.textContent = '';
-            }
-
-            codexOAuthPopup = codexOAuthPreparePopup();
-            if (!codexOAuthPopup) {
-                button.disabled = false;
-                status.style.color = '#f85149';
-                status.textContent = 'Failed to start OAuth: popup blocked by the browser';
-                codexOAuthSetOutcome('Open the OAuth URL manually from the link below.');
-                return;
-            }
-
-            try {
-                const beforeSnapshot = codexOAuthSnapshot((await codexOAuthFetchStatusSnapshot()).accounts);
-                const response = await fetch('/operator/codex/oauth-start', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({})
-                });
-                if (!response.ok) {
-                    throw new Error(await response.text());
-                }
-
-                const data = await response.json();
-                if (!data.oauth_url) {
-                    throw new Error('Missing oauth_url in response');
-                }
-
-                urlNode.textContent = data.oauth_url;
-                openLink.href = data.oauth_url;
-                result.style.display = 'block';
-                status.style.color = '#3fb950';
-                status.textContent = 'OAuth URL generated. Complete sign-in in the popup; this page will refresh when pool seat state changes.';
-                codexOAuthSetOutcome('Waiting for pool seat state to change.');
-                try {
-                    sessionStorage.setItem(codexOAuthStatusKey, JSON.stringify({
-                        before: beforeSnapshot,
-                        backendMode: String(data.result_mode || data.result || data.status || ''),
-                    }));
-                } catch (error) {
-                    // Ignore storage failures on hardened browsers.
-                }
-                codexOAuthPopup.location.href = data.oauth_url;
-                codexOAuthWatchStatusChange(beforeSnapshot, data.result_mode || data.result || data.status);
-            } catch (error) {
-                codexOAuthStopWatcher();
-                if (codexOAuthPopup && !codexOAuthPopup.closed) {
-                    try {
-                        codexOAuthPopup.close();
-                    } catch (closeError) {
-                        // Ignore close failures.
-                    }
-                }
-                status.style.color = '#f85149';
-                status.textContent = 'Failed to start OAuth: ' + (error && error.message ? error.message : error);
-                codexOAuthSetOutcome('Use the Open OAuth Page link or retry after clearing the popup blocker.');
-                if (button) {
-                    button.disabled = false;
-                }
-            } finally {
-                if (!codexOAuthPopup) {
-                    button.disabled = false;
-                }
-            }
-        }
-
-        async function addOpenAIApiKeyFromStatus() {
-            const input = document.getElementById('openai-api-key-input');
-            const button = document.getElementById('openai-api-key-add-btn');
-            const status = document.getElementById('openai-api-key-add-status');
-            if (!input || !button || !status) {
-                return;
-            }
-
-            const apiKey = String(input.value || '').trim();
-            if (!apiKey) {
-                status.style.color = '#f85149';
-                status.textContent = 'Enter an OpenAI API key first.';
-                return;
-            }
-
-            button.disabled = true;
-            status.style.color = '#8b949e';
-            status.textContent = 'Saving API key and running health probe...';
-
-            try {
-                const response = await fetch('/operator/codex/api-key-add', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ api_key: apiKey })
-                });
-                const text = await response.text();
-                let data = null;
-                try {
-                    data = text ? JSON.parse(text) : null;
-                } catch (parseError) {
-                    data = null;
-                }
-                if (!response.ok) {
-                    throw new Error((data && data.error) || text || 'Failed to add API key');
-                }
-
-                input.value = '';
-                const accountID = String((data && data.account_id) || 'openai_api');
-                const healthStatus = String((data && data.health_status) || 'unknown');
-                const healthError = String((data && data.health_error) || '').trim();
-                if (data && data.dead) {
-                    status.style.color = '#d29922';
-                    status.textContent = 'Stored ' + accountID + ', but it is currently marked dead' + (healthError ? ': ' + healthError : '.');
-                } else {
-                    status.style.color = '#3fb950';
-                    status.textContent = 'Stored ' + accountID + '. Health: ' + healthStatus + (healthError ? ' (' + healthError + ')' : '') + '. Reloading status...';
-                }
-                window.setTimeout(() => window.location.reload(), 900);
-            } catch (error) {
-                status.style.color = '#f85149';
-                status.textContent = 'Failed to add API key: ' + (error && error.message ? error.message : error);
-            } finally {
-                button.disabled = false;
-            }
-        }
-
-        async function addGitLabClaudeTokenFromStatus() {
-            const tokenInput = document.getElementById('gitlab-claude-token-input');
-            const instanceInput = document.getElementById('gitlab-claude-instance-input');
-            const button = document.getElementById('gitlab-claude-token-add-btn');
-            const status = document.getElementById('gitlab-claude-token-add-status');
-            if (!tokenInput || !instanceInput || !button || !status) {
-                return;
-            }
-
-            const token = String(tokenInput.value || '').trim();
-            const instanceURL = String(instanceInput.value || '').trim() || 'https://gitlab.com';
-            if (!token) {
-                status.style.color = '#f85149';
-                status.textContent = 'Enter a GitLab token first.';
-                return;
-            }
-
-            button.disabled = true;
-            status.style.color = '#8b949e';
-            status.textContent = 'Saving GitLab token and fetching Duo direct-access credentials...';
-
-            try {
-                const response = await fetch('/operator/claude/gitlab-token-add', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ token: token, instance_url: instanceURL })
-                });
-                const text = await response.text();
-                let data = null;
-                try {
-                    data = text ? JSON.parse(text) : null;
-                } catch (parseError) {
-                    data = null;
-                }
-                if (!response.ok) {
-                    throw new Error((data && data.error) || text || 'Failed to add GitLab token');
-                }
-
-                tokenInput.value = '';
-                const accountID = String((data && data.account_id) || 'claude_gitlab');
-                const healthStatus = String((data && data.health_status) || 'unknown');
-                const healthError = String((data && data.health_error) || '').trim();
-                if (data && data.dead) {
-                    status.style.color = '#d29922';
-                    status.textContent = 'Stored ' + accountID + ', but it is currently marked dead' + (healthError ? ': ' + healthError : '.');
-                } else {
-                    status.style.color = '#3fb950';
-                    status.textContent = 'Stored ' + accountID + '. Health: ' + healthStatus + (healthError ? ' (' + healthError + ')' : '') + '. Reloading status...';
-                }
-                window.setTimeout(() => window.location.reload(), 900);
-            } catch (error) {
-                status.style.color = '#f85149';
-                status.textContent = 'Failed to add GitLab token: ' + (error && error.message ? error.message : error);
-            } finally {
-                button.disabled = false;
-            }
-        }
-
-        function geminiOAuthSnapshot(accounts) {
-            const rows = Array.isArray(accounts) ? accounts : [];
-            const geminiRows = rows
-                .filter((acc) => acc && acc.type === 'gemini')
-                .map((acc) => [
-                    String(acc.id || ''),
-                    String(acc.type || ''),
-                    String(acc.account_id || ''),
-                    String(acc.workspace_id || ''),
-                    String(acc.oauth_profile_id || ''),
-                    String(acc.last_refresh_at || ''),
-                    String(acc.auth_expires_at || ''),
-                    String(acc.health_status || ''),
-                    String(acc.health_checked_at || ''),
-                    String(acc.last_healthy_at || ''),
-                    String(acc.rate_limit_until || ''),
-                    String(!!acc.disabled),
-                    String(!!acc.dead),
-                ].join('|'))
-                .sort();
-
-            return {
-                count: geminiRows.length,
-                signature: geminiRows.join('\n'),
-            };
-        }
-
-        function geminiOAuthDescribeOutcome(before, after, backendMode) {
-            const mode = String(backendMode || '').trim().toLowerCase();
-            if (mode === 'added') {
-                return 'Antigravity Gemini auth completed. Added a new seat; refreshing status now.';
-            }
-            if (mode === 'refreshed') {
-                return 'Antigravity Gemini auth completed. Refreshed an existing seat; refreshing status now.';
-            }
-            if (after.count > before.count) {
-                return 'Antigravity Gemini auth completed. Added a new seat; refreshing status now.';
-            }
-            if (after.signature !== before.signature) {
-                return 'Antigravity Gemini auth completed. Refreshed an existing seat; refreshing status now.';
-            }
-            return 'Antigravity Gemini auth completed. Refreshing status now.';
-        }
-
-        async function geminiOAuthFetchStatusSnapshot() {
-            const response = await fetch('/status?format=json', {
-                headers: { 'Accept': 'application/json' }
-            });
-            if (!response.ok) {
-                throw new Error(await response.text());
-            }
-            return response.json();
-        }
-
-        function geminiOAuthReadPendingState() {
-            try {
-                const raw = sessionStorage.getItem(geminiOAuthStatusKey);
-                return raw ? JSON.parse(raw) : null;
-            } catch (error) {
-                return null;
-            }
-        }
-
-        function geminiOAuthClearPendingState() {
-            try {
-                sessionStorage.removeItem(geminiOAuthStatusKey);
-            } catch (error) {
-                // Ignore storage errors.
-            }
-        }
-
-        function geminiOAuthSetOutcome(message) {
-            const outcome = document.getElementById('gemini-oauth-start-outcome');
-            if (outcome) {
-                outcome.textContent = message;
-            }
-        }
-
-        function geminiOAuthPreparePopup() {
-            const popup = window.open('', 'gemini-oauth-popup');
-            if (!popup) {
-                return null;
-            }
-            try {
-                popup.document.open();
-                popup.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Preparing Antigravity Gemini Auth</title></head><body style="font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px;"><div style="max-width: 640px; margin: 64px auto; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 24px;">Opening Antigravity Gemini auth session...</div></body></html>');
-                popup.document.close();
-                popup.focus();
-            } catch (error) {
-                // Ignore document writes that fail on hardened browsers.
-            }
-            return popup;
-        }
-
-        function geminiOAuthStopWatcher() {
-            if (geminiOAuthWatcher !== null) {
-                window.clearTimeout(geminiOAuthWatcher);
-                geminiOAuthWatcher = null;
-            }
-        }
-
-        function geminiOAuthClosePopup() {
-            if (geminiOAuthPopup && !geminiOAuthPopup.closed) {
-                try {
-                    geminiOAuthPopup.close();
-                } catch (error) {
-                    // Ignore close failures.
-                }
-            }
-            geminiOAuthPopup = null;
-        }
-
-        function geminiOAuthIsTrustedOrigin(origin) {
-            const value = String(origin || '').trim();
-            if (!value) {
-                return false;
-            }
-            try {
-                const current = new URL(window.location.origin);
-                const candidate = new URL(value);
-                const loopbackHosts = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
-                return current.protocol === candidate.protocol &&
-                    String(current.port || '') === String(candidate.port || '') &&
-                    loopbackHosts.has(current.hostname) &&
-                    loopbackHosts.has(candidate.hostname);
-            } catch (error) {
-                return false;
-            }
-        }
-
-        function geminiOAuthSnapshotsEqual(beforeSnapshot, afterSnapshot) {
-            return beforeSnapshot.count === afterSnapshot.count && beforeSnapshot.signature === afterSnapshot.signature;
-        }
-
-        async function geminiOAuthFinalize(beforeSnapshot, backendMode, resultPayload) {
-            const button = document.getElementById('gemini-oauth-start-btn');
-            const status = document.getElementById('gemini-oauth-start-status');
-            const result = document.getElementById('gemini-oauth-start-result');
-            geminiOAuthDone = true;
-            geminiOAuthStopWatcher();
-            geminiOAuthClosePopup();
-
-            try {
-                const afterSnapshot = geminiOAuthSnapshot((await geminiOAuthFetchStatusSnapshot()).accounts);
-                const fallbackMessage = geminiOAuthDescribeOutcome(beforeSnapshot, afterSnapshot, backendMode);
-                const message = String((resultPayload && resultPayload.message) || fallbackMessage).trim() || fallbackMessage;
-                const healthError = String((resultPayload && resultPayload.health_error) || '').trim();
-                if (status) {
-                    status.style.color = (resultPayload && resultPayload.dead) ? '#d29922' : '#3fb950';
-                    status.textContent = message + (healthError ? ' (' + healthError + ')' : '');
-                }
-                geminiOAuthSetOutcome(message);
-                geminiOAuthClearPendingState();
-                window.setTimeout(() => {
-                    if (button) {
-                        button.disabled = false;
-                    }
-                    if (result) {
-                        result.style.display = 'block';
-                    }
-                    window.location.reload();
-                }, 850);
-            } catch (error) {
-                if (button) {
-                    button.disabled = false;
-                }
-                if (status) {
-                    status.style.color = '#f85149';
-                    status.textContent = 'Antigravity Gemini auth completed, but status refresh failed: ' + (error && error.message ? error.message : error);
-                }
-                geminiOAuthSetOutcome('Refresh failed. Use the Open Antigravity Auth Page link or retry after clearing the popup blocker.');
-                geminiOAuthClearPendingState();
-            }
-        }
-
-        function geminiOAuthWatchStatusChange(beforeSnapshot, backendMode) {
-            const button = document.getElementById('gemini-oauth-start-btn');
-            const status = document.getElementById('gemini-oauth-start-status');
-            let attempts = 0;
-            const maxAttempts = 150;
-            const tick = async () => {
-                if (geminiOAuthWatcher === null) {
-                    return;
-                }
-                attempts += 1;
-                try {
-                    const afterSnapshot = geminiOAuthSnapshot((await geminiOAuthFetchStatusSnapshot()).accounts);
-                    if (!geminiOAuthSnapshotsEqual(beforeSnapshot, afterSnapshot)) {
-                        if (status) {
-                            status.style.color = '#3fb950';
-                            status.textContent = 'Antigravity Gemini auth callback applied. Refreshing status now.';
-                        }
-                        void geminiOAuthFinalize(beforeSnapshot, backendMode, null);
-                        return;
-                    }
-                    if (status) {
-                        status.style.color = '#8b949e';
-                        status.textContent = 'Waiting for the Antigravity Gemini seat state to change...';
-                    }
-                } catch (error) {
-                    if (status) {
-                        status.style.color = '#8b949e';
-                        status.textContent = 'Waiting for the Antigravity Gemini seat state to change...';
-                    }
-                }
-                if (attempts >= maxAttempts) {
-                    geminiOAuthStopWatcher();
-                    geminiOAuthClosePopup();
-                    geminiOAuthClearPendingState();
-                    if (button) {
-                        button.disabled = false;
-                    }
-                    if (status) {
-                        status.style.color = '#d29922';
-                        status.textContent = 'Timed out waiting for the Antigravity Gemini seat state to change. Use the Open Antigravity Auth Page link to retry.';
-                    }
-                    geminiOAuthSetOutcome('No Antigravity Gemini seat state change was detected yet.');
-                    return;
-                }
-                geminiOAuthWatcher = window.setTimeout(tick, 2000);
-            };
-            if (status) {
-                status.style.color = '#8b949e';
-                status.textContent = 'Waiting for the Antigravity Gemini seat state to change...';
-            }
-            geminiOAuthWatcher = window.setTimeout(tick, 2000);
-        }
-
-        function geminiOAuthEnsureMessageListener() {
-            if (geminiOAuthMessageBound) {
-                return;
-            }
-            geminiOAuthMessageBound = true;
-            window.addEventListener('message', (event) => {
-                if (!geminiOAuthIsTrustedOrigin(event && event.origin)) {
-                    return;
-                }
-                const data = event && event.data;
-                if (!data || data.type !== 'gemini_oauth_result') {
-                    return;
-                }
-
-                const button = document.getElementById('gemini-oauth-start-btn');
-                const status = document.getElementById('gemini-oauth-start-status');
-                const pendingState = geminiOAuthReadPendingState();
-                const beforeSnapshot = pendingState && pendingState.before ? pendingState.before : { count: 0, signature: '' };
-                const backendMode = (data && typeof data.created === 'boolean')
-                    ? (data.created ? 'added' : 'refreshed')
-                    : (pendingState && pendingState.backendMode ? pendingState.backendMode : '');
-
-                if (data && data.ok) {
-                    void geminiOAuthFinalize(beforeSnapshot, backendMode, data);
-                    return;
-                }
-
-                geminiOAuthDone = true;
-                geminiOAuthStopWatcher();
-                geminiOAuthClosePopup();
-                geminiOAuthClearPendingState();
-                if (button) {
-                    button.disabled = false;
-                }
-                if (!status) {
-                    return;
-                }
-
-                const message = String((data && data.message) || 'Antigravity Gemini auth failed.').trim();
-                geminiOAuthSetOutcome(message);
-                status.style.color = '#f85149';
-                status.textContent = message || 'Antigravity Gemini auth failed.';
-            }, false);
-        }
-
-        async function startGeminiOAuthFromStatus() {
-            const button = document.getElementById('gemini-oauth-start-btn');
-            const status = document.getElementById('gemini-oauth-start-status');
-            const result = document.getElementById('gemini-oauth-start-result');
-            const urlNode = document.getElementById('gemini-oauth-start-url');
-            const openLink = document.getElementById('gemini-oauth-start-open');
-            if (!button || !status || !result || !urlNode || !openLink) {
-                return;
-            }
-
-            geminiOAuthEnsureMessageListener();
-            geminiOAuthDone = false;
-            geminiOAuthStopWatcher();
-            geminiOAuthClosePopup();
-            geminiOAuthPopup = geminiOAuthPreparePopup();
-
-            button.disabled = true;
-            status.style.color = '#8b949e';
-            status.textContent = 'Starting Antigravity Gemini auth session...';
-            result.style.display = 'none';
-            urlNode.textContent = '';
-            openLink.href = '#';
-            geminiOAuthSetOutcome('');
-
-            try {
-                const beforeSnapshot = geminiOAuthSnapshot((await geminiOAuthFetchStatusSnapshot()).accounts);
-                const response = await fetch('/operator/gemini/antigravity/oauth-start', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({})
-                });
-                if (!response.ok) {
-                    throw new Error(await response.text());
-                }
-
-                const data = await response.json();
-                if (!data || !data.oauth_url) {
-                    throw new Error('Missing oauth_url in response');
-                }
-
-                urlNode.textContent = data.oauth_url;
-                openLink.href = data.oauth_url;
-                result.style.display = 'block';
-                geminiOAuthSetOutcome('Waiting for the Antigravity Gemini seat state to change.');
-                try {
-                    sessionStorage.setItem(geminiOAuthStatusKey, JSON.stringify({
-                        before: beforeSnapshot,
-                        backendMode: String(data.result_mode || data.result || ''),
-                    }));
-                } catch (error) {
-                    // Ignore storage failures on hardened browsers.
-                }
-                if (geminiOAuthPopup) {
-                    geminiOAuthPopup.location.href = data.oauth_url;
-                    status.style.color = '#3fb950';
-                    status.textContent = 'Antigravity auth URL generated. Complete sign-in in the popup; this page will refresh when the Gemini seat is stored.';
-                } else {
-                    status.style.color = '#d29922';
-                    status.textContent = 'Antigravity auth URL generated, but the popup was blocked. Open the page from the link below; this page will keep watching for the Gemini seat.';
-                }
-                geminiOAuthWatchStatusChange(beforeSnapshot, data.result_mode || data.result || '');
-            } catch (error) {
-                geminiOAuthStopWatcher();
-                geminiOAuthClosePopup();
-                geminiOAuthClearPendingState();
-                button.disabled = false;
-                status.style.color = '#f85149';
-                status.textContent = 'Failed to start Antigravity Gemini auth: ' + (error && error.message ? error.message : error);
-                geminiOAuthSetOutcome('Retry after clearing the popup blocker or open the Antigravity auth URL manually.');
-            }
-        }
-
-        async function deleteAccountFromStatus(button) {
-            const status = document.getElementById('account-action-status');
-            if (!button) {
-                return;
-            }
-
-            const accountID = String(button.getAttribute('data-account-id') || '').trim();
-            const label = String(button.getAttribute('data-account-label') || accountID).trim();
-            const kind = String(button.getAttribute('data-account-kind') || 'account').trim();
-            if (!accountID) {
-                return;
-            }
-
-            if (!window.confirm('Delete ' + kind + ' ' + label + '? This removes the local file from the pool.')) {
-                return;
-            }
-
-            button.disabled = true;
-            if (status) {
-                status.style.color = '#8b949e';
-                status.textContent = 'Deleting ' + kind + ' ' + label + '...';
-            }
-
-            try {
-                const response = await fetch('/operator/account-delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ account_id: accountID })
-                });
-                const text = await response.text();
-                let data = null;
-                try {
-                    data = text ? JSON.parse(text) : null;
-                } catch (parseError) {
-                    data = null;
-                }
-                if (!response.ok) {
-                    throw new Error((data && data.error) || text || 'Failed to delete account');
-                }
-
-                if (status) {
-                    status.style.color = '#3fb950';
-                    status.textContent = (data && data.already_removed)
-                        ? kind + ' ' + label + ' was already gone. Reloading status...'
-                        : 'Deleted ' + kind + ' ' + label + '. Reloading status...';
-                }
-                window.setTimeout(() => window.location.reload(), 700);
-            } catch (error) {
-                if (status) {
-                    status.style.color = '#f85149';
-                    status.textContent = 'Failed to delete ' + kind + ': ' + (error && error.message ? error.message : error);
-                }
-                button.disabled = false;
-            }
-        }
-
-        function codexOAuthHandleMessage(event) {
-            const origin = String((event && event.origin) || '');
-            if (origin !== 'http://localhost:1455' && origin !== 'http://127.0.0.1:1455') {
-                return;
-            }
-            const data = event && event.data;
-            if (!data || data.type !== 'codex-oauth-result') {
-                return;
-            }
-
-            const pendingState = codexOAuthReadPendingState();
-            const beforeSnapshot = pendingState && pendingState.before ? pendingState.before : { count: 0, signature: '' };
-            const backendMode = data && data.refreshed_existing ? 'refreshed' : (pendingState && pendingState.backendMode ? pendingState.backendMode : '');
-
-            if (data.success) {
-                if (data.detail) {
-                    codexOAuthSetOutcome(String(data.detail));
-                }
-                void codexOAuthFinalize(beforeSnapshot, backendMode);
-                return;
-            }
-
-            codexOAuthStopWatcher();
-            codexOAuthClearPendingState();
-            const button = document.getElementById('codex-oauth-start-btn');
-            const status = document.getElementById('codex-oauth-start-status');
-            if (button) {
-                button.disabled = false;
-            }
-            if (status) {
-                status.style.color = '#f85149';
-                status.textContent = 'OAuth callback failed: ' + String((data && data.detail) || 'Unknown error');
-            }
-            codexOAuthSetOutcome(String((data && data.detail) || (data && data.title) || 'OAuth callback failed.'));
-        }
-        window.addEventListener('message', codexOAuthHandleMessage);
-    </script>
-    {{end}}
 </body>
 </html>`

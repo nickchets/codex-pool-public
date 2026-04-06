@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -202,6 +203,157 @@ func TestPinnedConversationUnpinsAbovePreemptiveThreshold(t *testing.T) {
 	}
 }
 
+func TestPinnedConversationKeepsRefreshableExpiredCodexSeat(t *testing.T) {
+	now := time.Now()
+	sticky := &Account{
+		ID:           "sticky",
+		Type:         AccountTypeCodex,
+		PlanType:     "team",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    now.Add(-time.Minute),
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.20,
+			SecondaryUsedPercent: 0.20,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	healthy := &Account{
+		ID:       "healthy",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.10,
+			SecondaryUsedPercent: 0.10,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	p := newPoolState([]*Account{sticky, healthy}, false)
+	p.pin("conv", sticky.ID)
+
+	got := p.candidate("conv", nil, AccountTypeCodex, "")
+	if got == nil || got.ID != sticky.ID {
+		t.Fatalf("expected pinned refreshable expired codex seat to stay selected, got %+v", got)
+	}
+}
+
+func TestGitLabClaudeCandidatePrefersLeastRecentlyUsedSeat(t *testing.T) {
+	now := time.Now()
+	hot := &Account{
+		ID:          "gitlab-hot",
+		Type:        AccountTypeClaude,
+		AuthMode:    accountAuthModeGitLab,
+		PlanType:    "max",
+		LastUsed:    now.Add(-10 * time.Second),
+		AccessToken: "access-hot",
+		ExtraHeaders: map[string]string{
+			"X-Test": "hot",
+		},
+	}
+	cold := &Account{
+		ID:          "gitlab-cold",
+		Type:        AccountTypeClaude,
+		AuthMode:    accountAuthModeGitLab,
+		PlanType:    "max",
+		LastUsed:    now.Add(-2 * time.Minute),
+		AccessToken: "access-cold",
+		ExtraHeaders: map[string]string{
+			"X-Test": "cold",
+		},
+	}
+
+	p := newPoolState([]*Account{hot, cold}, false)
+	got := p.candidate("", nil, AccountTypeClaude, "")
+	if got == nil || got.ID != cold.ID {
+		t.Fatalf("expected least recently used gitlab seat, got %+v", got)
+	}
+}
+
+func TestGitLabClaudeCandidateRotatesAcrossNeverUsedSeats(t *testing.T) {
+	a := &Account{
+		ID:          "gitlab-a",
+		Type:        AccountTypeClaude,
+		AuthMode:    accountAuthModeGitLab,
+		AccessToken: "access-a",
+		ExtraHeaders: map[string]string{
+			"X-Test": "a",
+		},
+	}
+	b := &Account{
+		ID:          "gitlab-b",
+		Type:        AccountTypeClaude,
+		AuthMode:    accountAuthModeGitLab,
+		AccessToken: "access-b",
+		ExtraHeaders: map[string]string{
+			"X-Test": "b",
+		},
+	}
+	p := newPoolState([]*Account{a, b}, false)
+
+	first := p.candidate("", nil, AccountTypeClaude, "")
+	second := p.candidate("", nil, AccountTypeClaude, "")
+	if first == nil || second == nil {
+		t.Fatalf("expected gitlab seats, got first=%+v second=%+v", first, second)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("expected round-robin across equal never-used gitlab seats, got %s twice", first.ID)
+	}
+}
+
+func TestGitLabClaudeCandidatePrefersLowerInflightBeforeRecency(t *testing.T) {
+	now := time.Now()
+	idle := &Account{
+		ID:          "gitlab-idle",
+		Type:        AccountTypeClaude,
+		AuthMode:    accountAuthModeGitLab,
+		AccessToken: "access-idle",
+		LastUsed:    now.Add(-20 * time.Second),
+		ExtraHeaders: map[string]string{
+			"X-Test": "idle",
+		},
+	}
+	busy := &Account{
+		ID:          "gitlab-busy",
+		Type:        AccountTypeClaude,
+		AuthMode:    accountAuthModeGitLab,
+		AccessToken: "access-busy",
+		LastUsed:    now.Add(-2 * time.Minute),
+		ExtraHeaders: map[string]string{
+			"X-Test": "busy",
+		},
+		Inflight: 2,
+	}
+	p := newPoolState([]*Account{busy, idle}, false)
+
+	got := p.candidate("", nil, AccountTypeClaude, "")
+	if got == nil || got.ID != idle.ID {
+		t.Fatalf("expected lower inflight gitlab seat, got %+v", got)
+	}
+}
+
+func TestRoutingStateDoesNotBlockGitLabHeaderSnapshotAlone(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		ID:                       "gitlab-header-only",
+		Type:                     AccountTypeClaude,
+		AuthMode:                 accountAuthModeGitLab,
+		AccessToken:              "access-header-only",
+		ExtraHeaders:             map[string]string{"X-Test": "header-only"},
+		GitLabRateLimitLimit:     2000,
+		GitLabRateLimitRemaining: 0,
+		GitLabRateLimitResetAt:   now.Add(15 * time.Minute),
+	}
+
+	acc.mu.Lock()
+	routing := routingStateLocked(acc, now, AccountTypeClaude, "")
+	acc.mu.Unlock()
+
+	if !routing.Eligible {
+		t.Fatalf("expected gitlab direct-access header snapshot alone to stay routable, got %q", routing.BlockReason)
+	}
+}
+
 func TestCandidateReusesMostRecentlyUsedEligibleSeat(t *testing.T) {
 	now := time.Now()
 	sticky := &Account{
@@ -233,6 +385,42 @@ func TestCandidateReusesMostRecentlyUsedEligibleSeat(t *testing.T) {
 	got := p.candidate("", nil, AccountTypeCodex, "")
 	if got == nil || got.ID != "sticky" {
 		t.Fatalf("expected most recently used eligible seat, got %+v", got)
+	}
+}
+
+func TestCandidateReusesMostRecentlyUsedRefreshableExpiredCodexSeat(t *testing.T) {
+	now := time.Now()
+	sticky := &Account{
+		ID:           "sticky",
+		Type:         AccountTypeCodex,
+		PlanType:     "team",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    now.Add(-time.Minute),
+		LastUsed:     now.Add(-15 * time.Second),
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.20,
+			SecondaryUsedPercent: 0.20,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	healthy := &Account{
+		ID:       "healthier",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		LastUsed: now.Add(-2 * time.Minute),
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.05,
+			SecondaryUsedPercent: 0.05,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	p := newPoolState([]*Account{sticky, healthy}, false)
+
+	got := p.candidate("", nil, AccountTypeCodex, "")
+	if got == nil || got.ID != sticky.ID {
+		t.Fatalf("expected refreshable expired codex seat to stay sticky, got %+v", got)
 	}
 }
 
@@ -332,6 +520,80 @@ func TestCandidateKeepsActiveCodexSeatWhileEligible(t *testing.T) {
 	got := p.candidate("", nil, AccountTypeCodex, "")
 	if got == nil || got.ID != "active" {
 		t.Fatalf("expected active codex seat to be reused before LastUsed is populated, got %+v", got)
+	}
+}
+
+func TestCandidateKeepsRefreshableExpiredActiveCodexSeat(t *testing.T) {
+	now := time.Now()
+	active := &Account{
+		ID:           "active",
+		Type:         AccountTypeCodex,
+		PlanType:     "team",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    now.Add(-time.Minute),
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.25,
+			SecondaryUsedPercent: 0.20,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	betterScore := &Account{
+		ID:       "better-score",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.05,
+			SecondaryUsedPercent: 0.05,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	p := newPoolState([]*Account{active, betterScore}, false)
+	p.activeCodexID = active.ID
+
+	got := p.candidate("", nil, AccountTypeCodex, "")
+	if got == nil || got.ID != active.ID {
+		t.Fatalf("expected refreshable expired active codex seat to stay selected, got %+v", got)
+	}
+	if p.activeCodexID != active.ID {
+		t.Fatalf("expected active codex seat to stay on refreshable expired seat, got %q", p.activeCodexID)
+	}
+}
+
+func TestCandidateColdStartCodexTieBreakIgnoresRoundRobinOffset(t *testing.T) {
+	now := time.Now()
+	first := &Account{
+		ID:       "a-seat",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.10,
+			SecondaryUsedPercent: 0.20,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	second := &Account{
+		ID:       "b-seat",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.10,
+			SecondaryUsedPercent: 0.20,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	p := newPoolState([]*Account{first, second}, false)
+	p.rr = 1
+
+	got := p.candidate("", nil, AccountTypeCodex, "")
+	if got == nil || got.ID != "a-seat" {
+		t.Fatalf("expected stable cold-start codex selection, got %+v", got)
+	}
+	if p.activeCodexID != "a-seat" {
+		t.Fatalf("expected active codex seat to stay deterministic, got %q", p.activeCodexID)
 	}
 }
 
@@ -712,6 +974,54 @@ func TestRoutingStateBlocksMissingProjectGeminiSeat(t *testing.T) {
 	}
 }
 
+func TestRoutingStateAllowsWarmedMissingProjectAntigravityGeminiSeat(t *testing.T) {
+	now := time.Now()
+	seat := &Account{
+		ID:                      "gemini-seat",
+		Type:                    AccountTypeGemini,
+		OperatorSource:          geminiOperatorSourceAntigravityImport,
+		OAuthProfileID:          geminiOAuthAntigravityProfileID,
+		GeminiProviderCheckedAt: now.Add(-time.Minute),
+		GeminiOperationalState:  geminiOperationalTruthStateDegradedOK,
+		GeminiOperationalReason: "operator smoke succeeded via fallback project",
+	}
+
+	seat.mu.Lock()
+	routing := routingStateLocked(seat, now, AccountTypeGemini, "")
+	seat.mu.Unlock()
+
+	if !routing.Eligible {
+		t.Fatalf("expected warmed missing-project Antigravity seat to stay eligible, got %+v", routing)
+	}
+	if routing.BlockReason != "" {
+		t.Fatalf("block_reason=%q", routing.BlockReason)
+	}
+}
+
+func TestNoteGeminiOperationalSuccessLockedMissingProjectUsesFallbackReason(t *testing.T) {
+	now := time.Now().UTC()
+	seat := &Account{
+		ID:                      "gemini-seat",
+		Type:                    AccountTypeGemini,
+		OperatorSource:          geminiOperatorSourceAntigravityImport,
+		OAuthProfileID:          geminiOAuthAntigravityProfileID,
+		GeminiProviderCheckedAt: now.Add(-time.Minute),
+	}
+
+	seat.mu.Lock()
+	noteGeminiOperationalSuccessLocked(seat, now, "operator_smoke")
+	gotState := seat.GeminiOperationalState
+	gotReason := seat.GeminiOperationalReason
+	seat.mu.Unlock()
+
+	if gotState != geminiOperationalTruthStateDegradedOK {
+		t.Fatalf("operational_state=%q", gotState)
+	}
+	if !strings.Contains(gotReason, "fallback project") {
+		t.Fatalf("operational_reason=%q", gotReason)
+	}
+}
+
 func TestRoutingStateBlocksGeminiOperationalHardFail(t *testing.T) {
 	now := time.Now()
 	seat := &Account{
@@ -886,6 +1196,59 @@ func TestNoteGeminiOperationalFailureLockedFallbackDoesNotShortenCooldown(t *tes
 	}
 }
 
+func TestNoteGeminiOperationalFailureForModelLockedUsesModelSpecificCooldown(t *testing.T) {
+	now := time.Date(2026, 3, 27, 15, 31, 42, 0, time.UTC)
+	preciseUntil := time.Date(2026, 3, 27, 15, 31, 46, 0, time.UTC)
+	acc := &Account{
+		ID:             "gemini-seat",
+		Type:           AccountTypeGemini,
+		RateLimitUntil: now.Add(45 * time.Second),
+	}
+	err := &geminiCodeAssistHTTPError{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     "429 Too Many Requests",
+		Message: `{
+  "error": {
+    "code": 429,
+    "message": "You have exhausted your capacity on this model. Your quota will reset after 3s.",
+    "status": "RESOURCE_EXHAUSTED",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "RATE_LIMIT_EXCEEDED",
+        "metadata": {
+          "model": "gemini-3.1-pro-high",
+          "quotaResetTimeStamp": "2026-03-27T15:31:46Z",
+          "quotaResetDelay": "3.923606893s"
+        }
+      },
+      {
+        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+        "retryDelay": "3.923606893s"
+      }
+    ]
+  }
+}`,
+	}
+
+	acc.mu.Lock()
+	noteGeminiOperationalFailureForModelLocked(acc, now, "operator_smoke", err, "gemini-3.1-pro", "")
+	gotUntil := acc.RateLimitUntil
+	gotState := acc.GeminiOperationalState
+	gotModelUntil := acc.GeminiModelRateLimitResetTimes["gemini-3.1-pro-high"]
+	acc.mu.Unlock()
+
+	if !gotUntil.IsZero() {
+		t.Fatalf("rate_limit_until=%s, want zero", gotUntil)
+	}
+	if !gotModelUntil.Equal(preciseUntil) {
+		t.Fatalf("model_rate_limit_until=%s, want %s", gotModelUntil, preciseUntil)
+	}
+	if gotState != geminiOperationalTruthStateCooldown {
+		t.Fatalf("operational_state=%q", gotState)
+	}
+}
+
 func TestStaleAntigravityGeminiTruthRefreshEligibleLocked(t *testing.T) {
 	now := time.Now()
 	seat := &Account{
@@ -905,6 +1268,29 @@ func TestStaleAntigravityGeminiTruthRefreshEligibleLocked(t *testing.T) {
 
 	if !eligible {
 		t.Fatal("expected stale antigravity Gemini seat to need truth refresh")
+	}
+}
+
+func TestStaleAntigravityGeminiTruthRefreshEligibleLockedPreemptiveNearStale(t *testing.T) {
+	now := time.Now()
+	freshUntil := now.Add(6 * time.Minute)
+	seat := &Account{
+		ID:                      "gemini-seat-near-stale",
+		Type:                    AccountTypeGemini,
+		OperatorSource:          geminiOperatorSourceAntigravityImport,
+		AntigravitySource:       "browser_auth",
+		AccessToken:             "ya29.test",
+		AntigravityProjectID:    "project-1",
+		GeminiProviderCheckedAt: freshUntil.Add(-geminiProviderTruthFreshnessWindow),
+		GeminiQuotaUpdatedAt:    freshUntil.Add(-geminiProviderTruthFreshnessWindow),
+	}
+
+	seat.mu.Lock()
+	eligible := staleAntigravityGeminiTruthRefreshEligibleLocked(seat, now)
+	seat.mu.Unlock()
+
+	if !eligible {
+		t.Fatal("expected near-stale antigravity Gemini seat to refresh before freshness expires")
 	}
 }
 
@@ -1140,6 +1526,78 @@ func TestCandidateRetryPathDoesNotMoveActiveCodexSeat(t *testing.T) {
 	}
 	if activeID != "active" {
 		t.Fatalf("expected retry path to keep prior active seat, got %q", activeID)
+	}
+}
+
+func TestCodexFallbackIgnoresTierThresholdBuckets(t *testing.T) {
+	now := time.Now()
+	underThreshold := &Account{
+		ID:       "under-threshold",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Penalty:  0.90,
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.10,
+			SecondaryUsedPercent: 0.05,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	betterOverall := &Account{
+		ID:       "better-overall",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.10,
+			SecondaryUsedPercent: 0.25,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	p := newPoolState([]*Account{underThreshold, betterOverall}, false)
+
+	p.mu.Lock()
+	got := p.selectEligibleCandidateMatchingLocked(now, nil, AccountTypeCodex, "", true, true, nil)
+	p.mu.Unlock()
+
+	if got == nil || got.ID != betterOverall.ID {
+		t.Fatalf("expected codex fallback to prefer best overall seat, got %+v", got)
+	}
+}
+
+func TestCodexFallbackKeepsHighestAvailableTier(t *testing.T) {
+	now := time.Now()
+	proSeat := &Account{
+		ID:       "pro-seat",
+		Type:     AccountTypeCodex,
+		PlanType: "pro",
+		Penalty:  0.40,
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.10,
+			SecondaryUsedPercent: 0.30,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	teamSeat := &Account{
+		ID:       "team-seat",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.05,
+			SecondaryUsedPercent: 0.05,
+			PrimaryResetAt:       now.Add(2 * time.Hour),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+		},
+	}
+	p := newPoolState([]*Account{proSeat, teamSeat}, false)
+
+	p.mu.Lock()
+	got := p.selectEligibleCandidateMatchingLocked(now, nil, AccountTypeCodex, "", true, true, nil)
+	p.mu.Unlock()
+
+	if got == nil || got.ID != proSeat.ID {
+		t.Fatalf("expected codex fallback to keep highest available tier, got %+v", got)
 	}
 }
 

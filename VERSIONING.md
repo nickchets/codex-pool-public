@@ -72,4 +72,15 @@ Optional git metadata may be attached in release automation only, for example:
 - `0.5.1`: proxy response-handling seam cleanup across buffered, streamed, and websocket lanes with expanded regression coverage and text-first operator docs cleanup
 - `0.6.0`: Gemini operator onboarding, quarantine visibility, persistent Codex usage restore/models cache, and live-proven fallback/cooldown routing hardening
 - `0.6.1`: Gemini operator lane split, explicit source labels, and honest managed-OAuth degradation when local Gemini client credentials are absent
-- `0.7.0`: Antigravity Gemini onboarding/import, pooled Gemini Code Assist facade, provider-truth routing for imported Gemini seats, and end-to-end Claude trace observability
+- `0.7.0`: browser-auth Gemini onboarding/import, pooled Gemini Code Assist facade, provider-truth routing for imported Gemini seats, and end-to-end Claude trace observability
+- `0.8.0`: Gemini Browser Auth onboarding, OpenCode export/setup, reset tooling, and provider-scoped observability across Codex, Claude, and Gemini lanes
+- `0.8.1`: landing-page Gemini per-model quota visibility and truthful quota normalization
+- `0.8.2`: `/status` Gemini per-model quota visibility parity
+- `0.8.3`: warmed fallback-project Gemini seats stay routable instead of being falsely hard-blocked
+- `0.8.4`: model-specific Gemini cooldown export and operator smoke visibility
+- `0.8.5`: proactive Gemini provider-truth refresh and truthful cooldown health projection
+- `0.8.6`: Codex refresh-invalid health truth, deterministic sticky Codex seat selection, and canonical browser-auth Gemini/OpenCode operator cleanup
+- `0.8.7`: source-level follow-up that restores the canonical `/operator/gemini/oauth-start` browser-auth route in the published tree
+- `0.9.0`: screenshot-first operator-surface cleanup, diagnostics-only `/status`, broader exported Gemini model catalog, and Codex sticky/fallback follow-through for refreshable seats
+- `0.10.0`: isolated GitLab Codex sidecar publish, shared GitLab Claude org-TPM cooldown handling, and safer Gemini/OpenCode defaults plus catalog truth follow-through
+- `0.10.1`: sterile publish cleanup that removes repo-local governance/audit artifacts from `main` and aligns the public bundle export rules with the documented helper surface

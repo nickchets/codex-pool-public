@@ -1,6 +1,6 @@
 # Upstream Delta
 
-This repository started as an extraction layered on top of `darvell/codex-pool`.
+This repository started as an extraction from a private deployment layered on top of `darvell/codex-pool`.
 
 The current fork base for the imported Go tree is upstream commit `4570f6b`.
 

@@ -41,26 +41,29 @@ type config struct {
 	disableRefresh  bool
 	refreshProxyURL string // HTTP proxy URL for refresh operations
 
-	debug                bool
-	logBodies            bool
-	bodyLogLimit         int64
-	traceRequests        bool
-	tracePackets         bool
-	tracePayloads        bool
-	tracePayloadLimit    int
-	traceStallGap        time.Duration
-	maxInMemoryBodyBytes int64
-	flushInterval        time.Duration
-	usageRefresh         time.Duration
-	maxAttempts          int
-	storePath            string
-	retentionDays        int
-	friendCode           string
-	adminToken           string
-	requestTimeout       time.Duration // Timeout for non-streaming requests (0 = no timeout)
-	streamTimeout        time.Duration // Timeout for streaming/SSE requests (0 = no timeout)
-	streamIdleTimeout    time.Duration // Kill SSE streams idle for this long (0 = no idle timeout)
-	tierThreshold        float64       // Secondary usage % at which we stop preferring a tier (default 0.15)
+	debug                      bool
+	logBodies                  bool
+	bodyLogLimit               int64
+	traceRequests              bool
+	tracePackets               bool
+	tracePayloads              bool
+	tracePayloadLimit          int
+	traceStallGap              time.Duration
+	forceCodexRequiredPlan     string
+	gitLabCodexDiscoveryModels []string
+	maxInMemoryBodyBytes       int64
+	flushInterval              time.Duration
+	usageRefresh               time.Duration
+	maxAttempts                int
+	storePath                  string
+	retentionDays              int
+	friendCode                 string
+	adminToken                 string
+	requestTimeout             time.Duration // Timeout for non-streaming requests (0 = no timeout)
+	streamTimeout              time.Duration // Timeout for streaming/SSE requests (0 = no timeout)
+	streamIdleTimeout          time.Duration // Kill SSE streams idle for this long (0 = no idle timeout)
+	claudePingTailTimeout      time.Duration // Cut GitLab Claude SSE tails that degrade into ping-only keepalives after useful output
+	tierThreshold              float64       // Secondary usage % at which we stop preferring a tier (default 0.15)
 }
 
 func getenv(key, def string) string {
@@ -118,6 +121,8 @@ func buildConfig() config {
 	cfg.refreshProxyURL = getConfigString("REFRESH_PROXY_URL", fileCfg.RefreshProxyURL, "")
 
 	cfg.debug = getConfigBool("PROXY_DEBUG", fileCfg.Debug, false)
+	cfg.forceCodexRequiredPlan = normalizeForceCodexRequiredPlan(getConfigString("PROXY_FORCE_CODEX_REQUIRED_PLAN", fileCfg.ForceCodexRequiredPlan, ""))
+	cfg.gitLabCodexDiscoveryModels = parseCSVEnvList(getConfigString("PROXY_GITLAB_CODEX_DISCOVERY_MODELS", fileCfg.GitLabCodexDiscoveryModels, ""))
 	cfg.logBodies = getenv("PROXY_LOG_BODIES", "0") == "1"
 	cfg.bodyLogLimit = 16 * 1024 // 16 KiB
 	if v := getenv("PROXY_BODY_LOG_LIMIT", ""); v != "" {
@@ -188,6 +193,12 @@ func buildConfig() config {
 			cfg.streamIdleTimeout = time.Duration(n) * time.Second
 		}
 	}
+	cfg.claudePingTailTimeout = 18 * time.Second
+	if v := getenv("CLAUDE_PING_TAIL_TIMEOUT_SECONDS", ""); v != "" {
+		if n, err := parseInt64(v); err == nil && n >= 0 {
+			cfg.claudePingTailTimeout = time.Duration(n) * time.Second
+		}
+	}
 
 	// Tier threshold: secondary usage % at which we stop preferring a tier (default 15%)
 	cfg.tierThreshold = getConfigFloat64("TIER_THRESHOLD", fileCfg.TierThreshold, 0.15)
@@ -230,12 +241,13 @@ func main() {
 	}
 	defer store.Close()
 
-	if restoredTotals, restoredSnapshots, bridged := restorePersistedUsageState(pool.accounts, store); restoredTotals > 0 || restoredSnapshots > 0 || bridged > 0 {
+	if restoredTotals, restoredSnapshots, bridged, restoredRuntime := restorePersistedUsageState(pool.accounts, store); restoredTotals > 0 || restoredSnapshots > 0 || bridged > 0 || restoredRuntime > 0 {
 		log.Printf(
-			"restored usage state from disk: totals=%d snapshots=%d bridged_from_totals=%d",
+			"restored usage state from disk: totals=%d snapshots=%d bridged_from_totals=%d runtime=%d",
 			restoredTotals,
 			restoredSnapshots,
 			bridged,
+			restoredRuntime,
 		)
 	}
 
@@ -341,26 +353,30 @@ func main() {
 	} else {
 		log.Printf("WARNING: no admin token configured")
 	}
-	log.Printf("codex-pool proxy listening on %s (codex=%d, claude=%d, gemini=%d, kimi=%d, minimax=%d, request_timeout=%v, stream_timeout=%v, stream_idle_timeout=%v, trace_requests=%v, trace_packets=%v, trace_payloads=%v, trace_stall_gap=%v)",
-		cfg.listenAddr, codexCount, claudeCount, geminiCount, kimiCount, minimaxCount, cfg.requestTimeout, cfg.streamTimeout, cfg.streamIdleTimeout, cfg.traceRequests, cfg.tracePackets, cfg.tracePayloads, cfg.traceStallGap)
+	log.Printf("codex-pool proxy listening on %s (codex=%d, claude=%d, gemini=%d, kimi=%d, minimax=%d, request_timeout=%v, stream_timeout=%v, stream_idle_timeout=%v, claude_ping_tail_timeout=%v, trace_requests=%v, trace_packets=%v, trace_payloads=%v, trace_stall_gap=%v)",
+		cfg.listenAddr, codexCount, claudeCount, geminiCount, kimiCount, minimaxCount, cfg.requestTimeout, cfg.streamTimeout, cfg.streamIdleTimeout, cfg.claudePingTailTimeout, cfg.traceRequests, cfg.tracePackets, cfg.tracePayloads, cfg.traceStallGap)
+	if cfg.forceCodexRequiredPlan != "" {
+		log.Printf("codex forced required plan enabled: %s", cfg.forceCodexRequiredPlan)
+	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
 type proxyHandler struct {
-	cfg              config
-	transport        http.RoundTripper
-	refreshTransport http.RoundTripper // Separate transport for refresh ops (may use proxy)
-	pool             *poolState
-	poolUsers        *PoolUserStore
-	registry         *ProviderRegistry
-	store            *usageStore
-	metrics          *metrics
-	recent           *recentErrors
-	inflight         int64
-	startTime        time.Time
-	codexModels      codexModelsCache
+	cfg               config
+	transport         http.RoundTripper
+	refreshTransport  http.RoundTripper // Separate transport for refresh ops (may use proxy)
+	pool              *poolState
+	poolUsers         *PoolUserStore
+	registry          *ProviderRegistry
+	store             *usageStore
+	metrics           *metrics
+	recent            *recentErrors
+	inflight          int64
+	startTime         time.Time
+	codexModels       codexModelsCache
+	gitlabCodexModels codexModelsCache
 
 	// Rate limiting for token refresh operations
 	refreshMu       sync.Mutex
@@ -491,7 +507,7 @@ func isPermanentCodexAuthFailure(resp *http.Response, body []byte) bool {
 func markAccountDead(reqID string, acc *Account, reason string) {
 	now := time.Now().UTC()
 	acc.mu.Lock()
-	markAccountDeadStateLocked(acc, now, 100.0)
+	markAccountDeadWithReasonLocked(acc, now, 100.0, reason)
 	acc.mu.Unlock()
 	log.Printf("[%s] marking account %s as dead: %s", reqID, acc.ID, reason)
 	if err := saveAccount(acc); err != nil {
@@ -518,6 +534,20 @@ func (h *proxyHandler) applyUpstreamAuthFailureDisposition(reqID string, acc *Ac
 	if acc == nil || resp == nil {
 		return
 	}
+	if isGitLabCodexAccount(acc) {
+		if accountIsDead(acc) {
+			return
+		}
+		disposition := classifyManagedGitLabCodexError(managedGitLabCodexErrorSourceGatewayRequest, resp.StatusCode, resp.Header, inspectedBody)
+		applyManagedGitLabCodexDisposition(acc, disposition, resp.Header, time.Now())
+		if err := saveAccount(acc); err != nil {
+			log.Printf("[%s] warning: failed to save gitlab codex account %s: %v", reqID, acc.ID, err)
+		}
+		if disposition.MarkDead {
+			log.Printf("[%s] gitlab codex account %s marked dead: %s", reqID, acc.ID, disposition.Reason)
+		}
+		return
+	}
 	if isGitLabClaudeAccount(acc) {
 		if accountIsDead(acc) {
 			return
@@ -539,7 +569,7 @@ func (h *proxyHandler) applyUpstreamAuthFailureDisposition(reqID string, acc *Ac
 	if refreshFailed && acc.Type != AccountTypeCodex {
 		now := time.Now().UTC()
 		acc.mu.Lock()
-		markAccountDeadStateLocked(acc, now, 1.0)
+		markAccountDeadWithReasonLocked(acc, now, 1.0, "refresh failed after upstream auth failure")
 		acc.mu.Unlock()
 		if err := saveAccount(acc); err != nil {
 			log.Printf("[%s] warning: failed to save dead account %s: %v", reqID, acc.ID, err)
@@ -551,18 +581,86 @@ func (h *proxyHandler) applyUpstreamAuthFailureDisposition(reqID string, acc *Ac
 	acc.mu.Unlock()
 }
 
-func (h *proxyHandler) applyPreCopyUpstreamStatusDisposition(reqID string, acc *Account, resp *http.Response, refreshFailed bool, inspectedBody []byte) error {
+func geminiRateLimitUntilFromResponse(resp *http.Response, inspectedBody []byte, now time.Time) (time.Time, string, bool) {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return time.Time{}, "", false
+	}
+	bodyText := strings.TrimSpace(string(inspectedBody))
+	httpErr := &geminiCodeAssistHTTPError{
+		StatusCode: resp.StatusCode,
+		Status:     resp.Status,
+		Message:    bodyText,
+	}
+	if until, reason, precise, ok := geminiCodeAssistCooldownInfo(httpErr, now); ok {
+		if wait, hasRetryAfter := parseRetryAfter(resp.Header); hasRetryAfter {
+			headerUntil := now.Add(wait).UTC()
+			if !precise && headerUntil.After(until) {
+				until = headerUntil
+			}
+		}
+		return until.UTC(), sanitizeStatusMessage(firstNonEmpty(reason, bodyText, resp.Status)), true
+	}
+	if wait, ok := parseRetryAfter(resp.Header); ok {
+		return now.Add(wait).UTC(), sanitizeStatusMessage(firstNonEmpty(bodyText, resp.Status)), true
+	}
+	return now.Add(managedGeminiRateLimitWait).UTC(), sanitizeStatusMessage(firstNonEmpty(bodyText, resp.Status)), true
+}
+
+func (h *proxyHandler) applyGeminiRateLimitDisposition(acc *Account, resp *http.Response, inspectedBody []byte, requestedModel, requestPath string) bool {
+	if acc == nil || acc.Type != AccountTypeGemini || resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	now := time.Now().UTC()
+	until, reason, ok := geminiRateLimitUntilFromResponse(resp, inspectedBody, now)
+	if !ok || until.IsZero() {
+		return false
+	}
+	acc.mu.Lock()
+	modelKey := noteGeminiModelRateLimitedLocked(acc, requestedModel, requestPath, until)
+	if modelKey != "" {
+		acc.RateLimitUntil = time.Time{}
+	} else if acc.RateLimitUntil.Before(until) {
+		acc.RateLimitUntil = until
+	}
+	noteGeminiOperationalCooldownLocked(acc, now, "proxy", firstNonEmpty(reason, "rate limited"))
+	acc.Penalty += 1.0
+	acc.mu.Unlock()
+	return true
+}
+
+func (h *proxyHandler) applyPreCopyUpstreamStatusDisposition(reqID string, acc *Account, resp *http.Response, refreshFailed bool, inspectedBody []byte, requestedModel, requestPath string) error {
 	if acc == nil || resp == nil {
+		return nil
+	}
+	if isGitLabCodexAccount(acc) && (resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		if accountIsDead(acc) {
+			return nil
+		}
+		disposition := classifyManagedGitLabCodexError(managedGitLabCodexErrorSourceGatewayRequest, resp.StatusCode, resp.Header, inspectedBody)
+		applyManagedGitLabCodexDisposition(acc, disposition, resp.Header, time.Now())
+		if err := saveAccount(acc); err != nil {
+			log.Printf("[%s] warning: failed to save gitlab codex account %s: %v", reqID, acc.ID, err)
+		}
+		if disposition.MarkDead {
+			log.Printf("[%s] gitlab codex account %s unavailable: %s", reqID, acc.ID, disposition.Reason)
+		}
 		return nil
 	}
 	if isGitLabClaudeAccount(acc) && (resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 		if accountIsDead(acc) {
 			return nil
 		}
+		now := time.Now()
 		disposition := classifyManagedGitLabClaudeError(managedGitLabClaudeErrorSourceGatewayRequest, resp.StatusCode, resp.Header, inspectedBody)
-		applyManagedGitLabClaudeDisposition(acc, disposition, resp.Header, time.Now())
-		if err := saveAccount(acc); err != nil {
-			log.Printf("[%s] warning: failed to save gitlab claude account %s: %v", reqID, acc.ID, err)
+		applyManagedGitLabClaudeDisposition(acc, disposition, resp.Header, now)
+		sharedPersisted := false
+		if disposition.RateLimit && disposition.SharedOrgTPM {
+			sharedPersisted = h.propagateManagedGitLabClaudeSharedTPMCooldown(reqID, acc, disposition, resp.Header, requestedModel, now)
+		}
+		if !sharedPersisted {
+			if err := saveAccount(acc); err != nil {
+				log.Printf("[%s] warning: failed to save gitlab claude account %s: %v", reqID, acc.ID, err)
+			}
 		}
 		if disposition.MarkDead {
 			log.Printf("[%s] gitlab claude account %s unavailable: %s", reqID, acc.ID, disposition.Reason)
@@ -570,6 +668,9 @@ func (h *proxyHandler) applyPreCopyUpstreamStatusDisposition(reqID string, acc *
 		return nil
 	}
 	if resp.StatusCode == http.StatusTooManyRequests && !isManagedCodexAPIKeyAccount(acc) {
+		if h.applyGeminiRateLimitDisposition(acc, resp, inspectedBody, requestedModel, requestPath) {
+			return nil
+		}
 		h.applyRateLimit(acc, resp.Header, defaultRateLimitBackoff)
 		acc.mu.Lock()
 		acc.Penalty += 1.0
@@ -603,13 +704,15 @@ type preCopyUpstreamStatusHandlingResult struct {
 	InspectedBody  []byte
 }
 
-func (h *proxyHandler) applyPreCopyUpstreamStatusHandling(reqID string, acc *Account, resp *http.Response, refreshFailed bool, skipSwitchingProtocols bool) preCopyUpstreamStatusHandlingResult {
+func (h *proxyHandler) applyPreCopyUpstreamStatusHandling(reqID string, acc *Account, resp *http.Response, refreshFailed bool, requestedModel, requestPath string, skipSwitchingProtocols bool) preCopyUpstreamStatusHandlingResult {
 	result := preCopyUpstreamStatusHandlingResult{}
 	if resp == nil {
 		return result
 	}
 
 	result.NeedStatusBody = (isManagedCodexAPIKeyAccount(acc) && isManagedCodexAPIKeyRetryableStatus(resp.StatusCode)) ||
+		(acc != nil && acc.Type == AccountTypeGemini && resp.StatusCode == http.StatusTooManyRequests) ||
+		(isGitLabClaudeAccount(acc) && resp.StatusCode == http.StatusTooManyRequests) ||
 		resp.StatusCode == http.StatusUnauthorized ||
 		resp.StatusCode == http.StatusForbidden
 	if result.NeedStatusBody {
@@ -620,7 +723,7 @@ func (h *proxyHandler) applyPreCopyUpstreamStatusHandling(reqID string, acc *Acc
 		}
 	}
 	if !(skipSwitchingProtocols && resp.StatusCode == http.StatusSwitchingProtocols) {
-		_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, result.InspectedBody)
+		_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, result.InspectedBody, requestedModel, requestPath)
 	}
 	return result
 }
@@ -1058,10 +1161,15 @@ func formatBufferedRetryStatusError(resp *http.Response, bodyText string) error 
 	if resp == nil {
 		return nil
 	}
+	message := fmt.Sprintf("upstream %s", resp.Status)
 	if strings.TrimSpace(bodyText) != "" {
-		return fmt.Errorf("upstream %s: %s", resp.Status, bodyText)
+		message = fmt.Sprintf("upstream %s: %s", resp.Status, bodyText)
 	}
-	return fmt.Errorf("upstream %s", resp.Status)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		retryAfter, _ := parseRetryAfter(resp.Header)
+		return &rateLimitResponseError{message: message, retryAfter: retryAfter}
+	}
+	return errors.New(message)
 }
 
 type bufferedAttemptSuccess struct {
@@ -1081,9 +1189,55 @@ type copiedProxyResponseDeliveryOptions struct {
 	existingSample        *bytes.Buffer
 }
 
+type rateLimitResponseError struct {
+	message    string
+	retryAfter time.Duration
+}
+
+func (e *rateLimitResponseError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
+}
+
+func asRateLimitResponseError(err error) (*rateLimitResponseError, bool) {
+	var target *rateLimitResponseError
+	if !errors.As(err, &target) || target == nil {
+		return nil, false
+	}
+	return target, true
+}
+
+func retryAfterHeaderValue(wait time.Duration) string {
+	if wait <= 0 {
+		return ""
+	}
+	seconds := int((wait + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return strconv.Itoa(seconds)
+}
+
+func writeHTTPErrorWithOptionalRateLimit(w http.ResponseWriter, err error, fallbackStatus int) {
+	if err == nil {
+		http.Error(w, "request failed", fallbackStatus)
+		return
+	}
+	status := fallbackStatus
+	if rateLimitErr, ok := asRateLimitResponseError(err); ok {
+		status = http.StatusTooManyRequests
+		if retryAfter := retryAfterHeaderValue(rateLimitErr.retryAfter); retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+	}
+	http.Error(w, err.Error(), status)
+}
+
 func writeBufferedUnavailableAccountError(w http.ResponseWriter, lastErr error, accountType AccountType, requiredPlan, requestedModel string) {
 	if lastErr != nil {
-		http.Error(w, lastErr.Error(), http.StatusServiceUnavailable)
+		writeHTTPErrorWithOptionalRateLimit(w, lastErr, http.StatusServiceUnavailable)
 		return
 	}
 	if requiredPlan != "" {
@@ -1101,7 +1255,7 @@ func writeBufferedAttemptFailure(w http.ResponseWriter, lastStatus int, lastErr 
 	if lastErr == nil {
 		lastErr = errors.New("all attempts failed")
 	}
-	http.Error(w, lastErr.Error(), status)
+	writeHTTPErrorWithOptionalRateLimit(w, lastErr, status)
 }
 
 func bufferedRetryTraceReason(statusCode int, bodyText string) string {
@@ -1121,7 +1275,7 @@ func bufferedRetryTraceReason(statusCode int, bodyText string) string {
 	}
 }
 
-func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *requestTrace, acc *Account, resp *http.Response, refreshFailed bool, attempt, attempts int) (bool, error) {
+func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *requestTrace, acc *Account, resp *http.Response, refreshFailed bool, requestedModel, requestPath string, attempt, attempts int) (bool, error) {
 	var retryInspection bufferedRetryInspection
 	if needsBufferedRetryInspection(acc, resp.StatusCode) {
 		// Buffered retries never replay upstream bodies to the client, so one
@@ -1130,7 +1284,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests && !isManagedCodexAPIKeyAccount(acc) {
-		_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body)
+		_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
 		err := formatBufferedRetryStatusError(resp, retryInspection.Text)
 		h.recent.add(err.Error())
 		if h.cfg.debug {
@@ -1141,15 +1295,15 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 	}
 
 	if isManagedCodexAPIKeyAccount(acc) && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusPaymentRequired) {
-		err := h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body)
+		err := h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
 		trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
 		return true, err
 	}
 
 	// Handle 402 Payment Required - often means deactivated workspace/subscription.
 	if resp.StatusCode == http.StatusPaymentRequired {
-		if isGitLabClaudeAccount(acc) {
-			_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body)
+		if isGitLabClaudeAccount(acc) || isGitLabCodexAccount(acc) {
+			_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
 			err := formatBufferedRetryStatusError(resp, retryInspection.Text)
 			h.recent.add(err.Error())
 			trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
@@ -1159,7 +1313,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 		if strings.Contains(retryInspection.Text, "deactivated_workspace") || strings.Contains(retryInspection.Text, "subscription") {
 			now := time.Now().UTC()
 			acc.mu.Lock()
-			markAccountDeadStateLocked(acc, now, 100.0)
+			markAccountDeadWithReasonLocked(acc, now, 100.0, retryInspection.Text)
 			acc.mu.Unlock()
 			log.Printf("[%s] marking account %s as DEAD: %s", reqID, acc.ID, retryInspection.Text)
 			if err := saveAccount(acc); err != nil {
@@ -1174,7 +1328,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 
 	if isRetryableStatus(resp.StatusCode) {
 		if isManagedCodexAPIKeyAccount(acc) {
-			err := h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body)
+			err := h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
 			if h.cfg.debug {
 				log.Printf("[%s] attempt %d/%d account=%s retryable status=%d refreshFailed=%v", reqID, attempt, attempts, acc.ID, resp.StatusCode, refreshFailed)
 			}
@@ -1182,7 +1336,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 			return true, err
 		}
 
-		_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body)
+		_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			if refreshFailed && acc.Type != AccountTypeCodex {
 				log.Printf("[%s] account %s DEAD: 401/403 refresh failed, body=%s", reqID, acc.ID, retryInspection.Text)
@@ -1237,7 +1391,7 @@ func (h *proxyHandler) runBufferedAttemptContour(
 	var lastStatus int
 
 	for attempt := 1; attempt <= attempts; attempt++ {
-		acc, err := h.candidateSupportingPath(routePlan.Shape.ConversationID, exclude, routePlan.AccountType, routePlan.RequiredPlan, routePlan.Provider, routePlan.UpstreamPath, routePlan.DebugGeminiSeatID)
+		acc, err := h.candidateSupportingPath(routePlan.Shape.ConversationID, exclude, routePlan.AccountType, routePlan.RequiredPlan, routePlan.Provider, routePlan.UpstreamPath, routePlan.Shape.RequestedModel, routePlan.DebugGeminiSeatID)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1268,7 +1422,7 @@ func (h *proxyHandler) runBufferedAttemptContour(
 		}
 		lastStatus = resp.StatusCode
 
-		if retry, retryErr := h.applyBufferedRetryDisposition(reqID, trace, acc, resp, refreshFailed, attempt, attempts); retry {
+		if retry, retryErr := h.applyBufferedRetryDisposition(reqID, trace, acc, resp, refreshFailed, routePlan.Shape.RequestedModel, routePlan.UpstreamPath, attempt, attempts); retry {
 			lastErr = retryErr
 			continue
 		}
@@ -1284,7 +1438,7 @@ func (h *proxyHandler) runBufferedAttemptContour(
 	return nil, true
 }
 
-func (h *proxyHandler) candidateSupportingPath(conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string, provider Provider, path string, forcedGeminiSeatID string) (*Account, error) {
+func (h *proxyHandler) candidateSupportingPath(conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string, provider Provider, path, requestedModel, forcedGeminiSeatID string) (*Account, error) {
 	if h == nil || h.pool == nil {
 		return nil, nil
 	}
@@ -1312,18 +1466,180 @@ func (h *proxyHandler) candidateSupportingPath(conversationID string, exclude ma
 		}
 	}
 
+	now := time.Now().UTC()
 	for attempt := 0; attempt < attempts; attempt++ {
 		acc := h.pool.candidate(conversationID, exclude, accountType, requiredPlan)
 		if acc == nil {
-			return nil, nil
+			break
 		}
 		exclude[acc.ID] = true
-		if providerSupportsPathForAccount(provider, path, acc) {
-			return acc, nil
+		if !providerSupportsPathForAccount(provider, path, acc) {
+			continue
+		}
+		if acc.Type == AccountTypeGemini {
+			acc.mu.Lock()
+			until, _, limited := geminiRequestedModelRateLimitUntilLocked(acc, requestedModel, path, now)
+			acc.mu.Unlock()
+			if limited && until.After(now) {
+				continue
+			}
+		}
+		return acc, nil
+	}
+
+	if err := h.gitLabClaudeSharedTPMCooldownError(now, accountType, requiredPlan, provider, path); err != nil {
+		return nil, err
+	}
+	if err := h.gitLabCodexCooldownError(now, accountType, requiredPlan, provider, path); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (h *proxyHandler) propagateManagedGitLabClaudeSharedTPMCooldown(reqID string, trigger *Account, disposition managedGitLabClaudeErrorDisposition, headers http.Header, requestedModel string, now time.Time) bool {
+	if h == nil || h.pool == nil || trigger == nil || !isGitLabClaudeAccount(trigger) || !disposition.RateLimit || !disposition.SharedOrgTPM {
+		return false
+	}
+
+	scopeKey := gitLabClaudeScopeKey(trigger)
+	if scopeKey == "" {
+		return false
+	}
+	wait := managedGitLabClaudeCooldownWait(disposition, headers)
+	if wait <= 0 {
+		wait = managedGitLabClaudeOrgTPMRateLimitWait
+	}
+	until := now.Add(wait)
+	sharedReason := managedGitLabClaudeSharedOrgTPMHealthError(disposition.Reason)
+
+	h.pool.mu.RLock()
+	accounts := append([]*Account{}, h.pool.accounts...)
+	h.pool.mu.RUnlock()
+
+	var affected []string
+	for _, acc := range accounts {
+		if acc == nil || !isGitLabClaudeAccount(acc) || gitLabClaudeScopeKey(acc) != scopeKey {
+			continue
+		}
+
+		changed := false
+		acc.mu.Lock()
+		if acc.Disabled || acc.Dead {
+			acc.mu.Unlock()
+			continue
+		}
+		if acc.RateLimitUntil.Before(until) {
+			acc.RateLimitUntil = until
+			changed = true
+		}
+		if acc.HealthStatus != "rate_limited" {
+			acc.HealthStatus = "rate_limited"
+			changed = true
+		}
+		if acc.HealthCheckedAt.Before(now) {
+			acc.HealthCheckedAt = now
+			changed = true
+		}
+		if acc.HealthError != sharedReason {
+			acc.HealthError = sharedReason
+			changed = true
+		}
+		acc.mu.Unlock()
+
+		if !changed {
+			continue
+		}
+		affected = append(affected, acc.ID)
+		if err := saveAccount(acc); err != nil {
+			log.Printf("[%s] warning: failed to persist shared gitlab claude cooldown for %s: %v", reqID, acc.ID, err)
 		}
 	}
 
-	return nil, nil
+	if len(affected) == 0 {
+		return false
+	}
+	log.Printf("[%s] gitlab claude shared org TPM cooldown activated scope=%s requested_model=%q until=%s seats=%s reason=%s", reqID, scopeKey, requestedModel, until.UTC().Format(time.RFC3339), strings.Join(affected, ","), stripManagedGitLabClaudeSharedOrgTPMHealthPrefix(sharedReason))
+	return true
+}
+
+func (h *proxyHandler) gitLabClaudeSharedTPMCooldownError(now time.Time, accountType AccountType, requiredPlan string, provider Provider, path string) error {
+	if h == nil || h.pool == nil || accountType != AccountTypeClaude || provider == nil || provider.Type() != AccountTypeClaude {
+		return nil
+	}
+
+	h.pool.mu.RLock()
+	accounts := append([]*Account{}, h.pool.accounts...)
+	h.pool.mu.RUnlock()
+
+	var until time.Time
+	reason := ""
+	for _, acc := range accounts {
+		if acc == nil || !isGitLabClaudeAccount(acc) || !planMatchesRequired(acc.PlanType, requiredPlan) || !providerSupportsPathForAccount(provider, path, acc) {
+			continue
+		}
+		acc.mu.Lock()
+		rateLimitUntil := acc.RateLimitUntil
+		healthStatus := acc.HealthStatus
+		healthError := acc.HealthError
+		acc.mu.Unlock()
+		if !rateLimitUntil.After(now) || healthStatus != "rate_limited" || !isManagedGitLabClaudeSharedOrgTPMHealthError(healthError) {
+			continue
+		}
+		if until.IsZero() || rateLimitUntil.Before(until) {
+			until = rateLimitUntil
+			reason = stripManagedGitLabClaudeSharedOrgTPMHealthPrefix(healthError)
+		}
+	}
+	if until.IsZero() {
+		return nil
+	}
+	return &rateLimitResponseError{
+		message:    firstNonEmpty(reason, "gitlab claude organization token-per-minute cooldown active"),
+		retryAfter: until.Sub(now),
+	}
+}
+
+func (h *proxyHandler) gitLabCodexCooldownError(now time.Time, accountType AccountType, requiredPlan string, provider Provider, path string) error {
+	if h == nil || h.pool == nil || accountType != AccountTypeCodex || provider == nil || provider.Type() != AccountTypeCodex || !codexRequiresGitLabPlan(requiredPlan) {
+		return nil
+	}
+
+	h.pool.mu.RLock()
+	accounts := append([]*Account{}, h.pool.accounts...)
+	h.pool.mu.RUnlock()
+
+	var until time.Time
+	reason := ""
+	relevant := 0
+	for _, acc := range accounts {
+		if acc == nil || !isGitLabCodexAccount(acc) || !planMatchesRequired(acc.PlanType, requiredPlan) || !providerSupportsPathForAccount(provider, path, acc) {
+			continue
+		}
+		acc.mu.Lock()
+		disabled := acc.Disabled
+		dead := acc.Dead
+		rateLimitUntil := acc.RateLimitUntil
+		healthError := acc.HealthError
+		acc.mu.Unlock()
+		if disabled || dead {
+			continue
+		}
+		relevant++
+		if !rateLimitUntil.After(now) {
+			return nil
+		}
+		if until.IsZero() || rateLimitUntil.Before(until) {
+			until = rateLimitUntil
+			reason = strings.TrimSpace(healthError)
+		}
+	}
+	if relevant == 0 || until.IsZero() {
+		return nil
+	}
+	return &rateLimitResponseError{
+		message:    firstNonEmpty(reason, "gitlab codex cooldown active"),
+		retryAfter: until.Sub(now),
+	}
 }
 
 func (h *proxyHandler) deliverCopiedProxyResponse(
@@ -1530,6 +1846,9 @@ func (h *proxyHandler) proxyRequest(w http.ResponseWriter, r *http.Request, reqI
 	if h.maybeServeCachedCodexModels(w, r, reqID, admission) {
 		return
 	}
+	if h.maybeServeGitLabCodexAuxiliary(w, r, reqID, admission) {
+		return
+	}
 
 	if isWebSocketUpgradeRequest(r) {
 		shape := buildWebSocketRequestShape(r)
@@ -1674,13 +1993,15 @@ func (h *proxyHandler) proxyRequestWebSocket(w http.ResponseWriter, r *http.Requ
 	trace := requestTraceFromContext(r.Context())
 	accountType := routePlan.AccountType
 	conversationID := routePlan.Shape.ConversationID
+	requestedModel := routePlan.Shape.RequestedModel
+	requestPath := routePlan.UpstreamPath
 	userID := routePlan.Admission.UserID
 	provider := routePlan.Provider
 	targetBase := routePlan.TargetBase
 
-	acc, err := h.candidateSupportingPath(conversationID, map[string]bool{}, accountType, routePlan.RequiredPlan, provider, routePlan.UpstreamPath, routePlan.DebugGeminiSeatID)
+	acc, err := h.candidateSupportingPath(conversationID, map[string]bool{}, accountType, routePlan.RequiredPlan, provider, requestPath, requestedModel, routePlan.DebugGeminiSeatID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeHTTPErrorWithOptionalRateLimit(w, err, http.StatusServiceUnavailable)
 		return
 	}
 	if acc == nil {
@@ -1746,7 +2067,7 @@ func (h *proxyHandler) proxyRequestWebSocket(w http.ResponseWriter, r *http.Requ
 
 	var statusCode int
 	var proxyErr error
-	statusCode, proxyErr = h.servePooledWebSocketProxy(w, r, reqID, trace, outURL, targetBase, provider, acc, access, protocolAuthUsed, refreshFailed, conversationID)
+	statusCode, proxyErr = h.servePooledWebSocketProxy(w, r, reqID, trace, outURL, targetBase, provider, acc, access, protocolAuthUsed, refreshFailed, conversationID, requestedModel, requestPath)
 
 	if proxyErr != nil {
 		h.recent.add(proxyErr.Error())
@@ -1772,7 +2093,7 @@ func (h *proxyHandler) servePooledWebSocketProxy(
 	access string,
 	protocolAuthUsed bool,
 	refreshFailed bool,
-	conversationID string,
+	conversationID, requestedModel, requestPath string,
 ) (int, error) {
 	var statusCode int
 	var proxyErr error
@@ -1803,7 +2124,7 @@ func (h *proxyHandler) servePooledWebSocketProxy(
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			statusCode = resp.StatusCode
-			return h.modifyWebSocketProxyResponse(reqID, trace, provider, acc, resp, refreshFailed, conversationID)
+			return h.modifyWebSocketProxyResponse(reqID, trace, provider, acc, resp, refreshFailed, conversationID, requestedModel, requestPath)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			proxyErr = err
@@ -1852,6 +2173,7 @@ func (h *proxyHandler) finalizeWebSocketSuccessState(acc *Account, conversationI
 	}
 	applySuccessfulAccountStateLocked(acc, now)
 	acc.mu.Unlock()
+	persistAccountRuntimeState(h.store, acc)
 	if shouldPersistGemini {
 		if err := saveAccount(acc); err != nil {
 			log.Printf("warning: failed to persist healthy gemini account %s after websocket success: %v", acc.ID, err)
@@ -1859,7 +2181,7 @@ func (h *proxyHandler) finalizeWebSocketSuccessState(acc *Account, conversationI
 	}
 }
 
-func (h *proxyHandler) modifyWebSocketProxyResponse(reqID string, trace *requestTrace, provider Provider, acc *Account, resp *http.Response, refreshFailed bool, conversationID string) error {
+func (h *proxyHandler) modifyWebSocketProxyResponse(reqID string, trace *requestTrace, provider Provider, acc *Account, resp *http.Response, refreshFailed bool, conversationID, requestedModel, requestPath string) error {
 	if resp == nil {
 		return nil
 	}
@@ -1869,7 +2191,7 @@ func (h *proxyHandler) modifyWebSocketProxyResponse(reqID string, trace *request
 	if trace != nil {
 		trace.noteResponse(resp.StatusCode, resp, false)
 	}
-	h.applyPreCopyUpstreamStatusHandling(reqID, acc, resp, refreshFailed, true)
+	h.applyPreCopyUpstreamStatusHandling(reqID, acc, resp, refreshFailed, requestedModel, requestPath, true)
 	h.finalizeWebSocketSuccessState(acc, conversationID, resp.StatusCode)
 	return nil
 }
@@ -1987,9 +2309,9 @@ func (h *proxyHandler) proxyRequestStreamed(w http.ResponseWriter, r *http.Reque
 	provider := routePlan.Provider
 	targetBase := routePlan.TargetBase
 
-	acc, err := h.candidateSupportingPath(routePlan.Shape.ConversationID, map[string]bool{}, accountType, routePlan.RequiredPlan, provider, routePlan.UpstreamPath, routePlan.DebugGeminiSeatID)
+	acc, err := h.candidateSupportingPath(routePlan.Shape.ConversationID, map[string]bool{}, accountType, routePlan.RequiredPlan, provider, routePlan.UpstreamPath, routePlan.Shape.RequestedModel, routePlan.DebugGeminiSeatID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeHTTPErrorWithOptionalRateLimit(w, err, http.StatusServiceUnavailable)
 		return
 	}
 	if acc == nil {
@@ -2138,7 +2460,7 @@ func (h *proxyHandler) proxyRequestStreamed(w http.ResponseWriter, r *http.Reque
 		log.Printf("[%s] request body sample (%d bytes): %s", reqID, reqSample.Len(), safeText(reqSample.Bytes()))
 	}
 
-	statusHandling := h.applyPreCopyUpstreamStatusHandling(reqID, acc, resp, refreshFailed, false)
+	statusHandling := h.applyPreCopyUpstreamStatusHandling(reqID, acc, resp, refreshFailed, routePlan.Shape.RequestedModel, routePlan.UpstreamPath, false)
 	if statusHandling.NeedStatusBody && !isManagedCodexAPIKeyAccount(acc) && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 		log.Printf("[%s] account %s got %d from %s, body=%s", reqID, acc.ID, resp.StatusCode, outReq.URL.Host, safeText(statusHandling.InspectedBody))
 	}
@@ -2216,6 +2538,27 @@ func (h *proxyHandler) finalizeCopiedProxyResponse(reqID string, trace *requestT
 		return false
 	}
 	if copyErr != nil {
+		if cutoff, ok := matchClaudePingTailCutoff(copyErr, acc); ok {
+			h.finalizeProxyResponse(reqID, provider, acc, userID, statusCode, isSSE, managedStreamFailed, initialConversationID, headerPrimaryPct, headerSecondaryPct, respSample)
+			if h.metrics != nil {
+				h.metrics.inc(strconv.Itoa(statusCode), acc.ID)
+			}
+			if trace != nil {
+				trace.noteFinish(statusCode, isSSE, managedStreamFailed, nil)
+			}
+			log.Printf(
+				"[%s] claude gitlab ping-only tail cut off early (account=%s stalled_ms=%d timeout_ms=%d last_non_ping_type=%q)",
+				reqID,
+				acc.ID,
+				cutoff.stalledFor.Milliseconds(),
+				cutoff.timeout.Milliseconds(),
+				cutoff.lastNonPingType,
+			)
+			if h.cfg.debug {
+				log.Printf("[%s] %s status=%d account=%s duration_ms=%d", reqID, debugLabel, statusCode, acc.ID, time.Since(start).Milliseconds())
+			}
+			return true
+		}
 		if h.recent != nil {
 			h.recent.add(copyErr.Error())
 		}
@@ -2287,6 +2630,7 @@ func (h *proxyHandler) finalizeProxyResponse(reqID string, provider Provider, ac
 	}
 	applySuccessfulAccountStateLocked(acc, now)
 	acc.mu.Unlock()
+	persistAccountRuntimeState(h.store, acc)
 	if shouldPersistAccountState {
 		if err := saveAccount(acc); err != nil {
 			log.Printf("[%s] warning: failed to persist healthy %s account %s: %v", reqID, persistLabel, acc.ID, err)
@@ -2757,6 +3101,14 @@ func (h *proxyHandler) tryOnce(
 	}
 
 	requestBody := bodyBytes
+	if isGitLabCodexAccount(acc) {
+		if rewritten, changed := coerceGitLabCodexRequestBody(requestBody); changed {
+			requestBody = rewritten
+			if h.cfg.debug {
+				log.Printf("[%s] coerced gitlab codex request body text.verbosity -> medium (account=%s)", reqID, acc.ID)
+			}
+		}
+	}
 	targetBase = providerUpstreamURLForAccount(provider, upstreamPath, acc)
 	targetBases := []*url.URL{targetBase}
 	if facadeReq != nil {
@@ -2948,15 +3300,36 @@ func (h *proxyHandler) tryOnce(
 					errStr := err.Error()
 					if isRateLimitError(err) {
 						h.applyRateLimit(acc, nil, defaultRateLimitBackoff)
-					} else if strings.Contains(errStr, "invalid_grant") || strings.Contains(errStr, "refresh_token_reused") {
-						// If refresh token is permanently invalid, mark account as dead immediately
-						now := time.Now().UTC()
-						acc.mu.Lock()
-						markAccountDeadStateLocked(acc, now, 100.0)
-						acc.mu.Unlock()
-						log.Printf("[%s] marking account %s as dead: refresh token revoked/invalid", reqID, acc.ID)
-						if err := saveAccount(acc); err != nil {
-							log.Printf("[%s] warning: failed to save dead account %s: %v", reqID, acc.ID, err)
+					} else if isCodexRefreshTokenInvalidError(err) {
+						if acc.Type == AccountTypeCodex {
+							probeCtx, cancel := context.WithTimeout(ctx, codexModelsFetchTimeout)
+							probe, probeErr := h.probeCodexCurrentAccess(probeCtx, acc)
+							cancel()
+							now := time.Now().UTC()
+							acc.mu.Lock()
+							if probeErr == nil {
+								applyCodexRefreshInvalidProbeResultLocked(acc, now, probe, codexRefreshInvalidHealthError)
+							} else {
+								markCodexRefreshInvalidStateLocked(acc, now, codexRefreshInvalidHealthError, false)
+							}
+							acc.mu.Unlock()
+							if saveErr := saveAccount(acc); saveErr != nil {
+								log.Printf("[%s] warning: failed to persist codex account %s after refresh-invalid probe: %v", reqID, acc.ID, saveErr)
+							}
+							if probeErr != nil {
+								log.Printf("[%s] codex current access probe after refresh failure for %s failed: %v", reqID, acc.ID, probeErr)
+							} else {
+								log.Printf("[%s] codex current access probe after refresh failure for %s: status=%d working=%v mark_dead=%v reason=%q", reqID, acc.ID, probe.StatusCode, probe.Working, probe.MarkDead, probe.Reason)
+							}
+						} else {
+							now := time.Now().UTC()
+							acc.mu.Lock()
+							markAccountDeadWithReasonLocked(acc, now, 100.0, codexRefreshInvalidHealthError)
+							acc.mu.Unlock()
+							log.Printf("[%s] marking account %s as dead: %s", reqID, acc.ID, codexRefreshInvalidHealthError)
+							if err := saveAccount(acc); err != nil {
+								log.Printf("[%s] warning: failed to save dead account %s: %v", reqID, acc.ID, err)
+							}
 						}
 						refreshFailed = true
 					} else if !strings.Contains(errStr, "rate limited") {
@@ -3031,7 +3404,7 @@ func (h *proxyHandler) needsRefresh(a *Account) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if isGitLabClaudeAccount(a) && (strings.TrimSpace(a.AccessToken) == "" || len(a.ExtraHeaders) == 0) {
+	if (isGitLabClaudeAccount(a) || isGitLabCodexAccount(a)) && (strings.TrimSpace(a.AccessToken) == "" || len(a.ExtraHeaders) == 0) {
 		return true
 	}
 	if a.RefreshToken == "" {
@@ -3131,7 +3504,7 @@ func (h *proxyHandler) refreshAccountOnce(ctx context.Context, a *Account, force
 	// Per-account rate limiting (persisted to disk via LastRefresh)
 	a.mu.Lock()
 	sinceLastRefresh := time.Since(a.LastRefresh)
-	skipPerAccountThrottle := isGitLabClaudeAccount(a)
+	skipPerAccountThrottle := accountAuthMode(a) == accountAuthModeGitLab
 	if !force && !skipPerAccountThrottle && !a.LastRefresh.IsZero() && sinceLastRefresh < refreshPerAccountInterval {
 		a.mu.Unlock()
 		return fmt.Errorf("account refresh rate limited (%s), wait %v", a.ID, refreshPerAccountInterval-sinceLastRefresh)

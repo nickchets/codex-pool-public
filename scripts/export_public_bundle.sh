@@ -9,9 +9,9 @@ mkdir -p "$out_dir"
 
 rsync -a \
   --exclude='.git/' \
-  --exclude='dist/' \
-  --exclude='tmp/' \
-  --exclude='bin/' \
+  --exclude='codex-pool-proxy' \
+  --exclude='tests/' \
+  --exclude='screenshots/' \
   --exclude='__pycache__/' \
   --exclude='*.pyc' \
   --exclude='*.pyo' \
@@ -25,9 +25,9 @@ for required in README.md go.mod main.go status.go templates/local_landing.html;
 done
 
 declare -a forbidden_refs=(
+  "/home/"'lap'
   '.root''_layer'
   'ag''code'
-  'codex_pool_''manager.py'
   'codex.''ppflix.net'
 )
 
@@ -35,6 +35,19 @@ for needle in "${forbidden_refs[@]}"; do
   if rg -n --hidden --glob '!.git/**' --fixed-strings "$needle" "$out_dir" >/tmp/codex-pool-export-check.txt; then
     echo "forbidden reference leaked into public bundle: $needle" >&2
     cat /tmp/codex-pool-export-check.txt >&2
+    exit 1
+  fi
+done
+
+declare -a forbidden_paths=(
+  codex-pool-proxy
+  tests
+  screenshots
+)
+
+for rel in "${forbidden_paths[@]}"; do
+  if [[ -e "$out_dir/$rel" ]]; then
+    echo "forbidden path leaked into public bundle: $rel" >&2
     exit 1
   fi
 done

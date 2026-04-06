@@ -227,6 +227,91 @@ func TestCodexProviderLoadsManagedOpenAIAPIKeyAccount(t *testing.T) {
 	}
 }
 
+func TestSaveCodexAccountPersistsOAuthHealthState(t *testing.T) {
+	apiBase, _ := url.Parse("https://chatgpt.com")
+	provider := NewCodexProvider(apiBase, apiBase, apiBase, apiBase)
+
+	accFile := filepath.Join(t.TempDir(), "codex_oauth.json")
+	if err := os.WriteFile(accFile, []byte(`{"tokens":{"access_token":"seed-access","refresh_token":"seed-refresh"}}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	healthCheckedAt := time.Date(2026, 3, 28, 14, 0, 0, 0, time.UTC)
+	lastHealthyAt := healthCheckedAt.Add(-30 * time.Minute)
+	acc := &Account{
+		ID:              "seat-oauth",
+		Type:            AccountTypeCodex,
+		File:            accFile,
+		AccessToken:     "next-access",
+		RefreshToken:    "next-refresh",
+		HealthStatus:    codexRefreshInvalidHealthStatus,
+		HealthError:     codexRefreshInvalidHealthError,
+		HealthCheckedAt: healthCheckedAt,
+		LastHealthyAt:   lastHealthyAt,
+	}
+
+	if err := saveCodexAccount(acc); err != nil {
+		t.Fatalf("save codex account: %v", err)
+	}
+
+	raw, err := os.ReadFile(accFile)
+	if err != nil {
+		t.Fatalf("read auth file: %v", err)
+	}
+	loaded, err := provider.LoadAccount(filepath.Base(accFile), accFile, raw)
+	if err != nil {
+		t.Fatalf("load account: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected account")
+	}
+	if loaded.HealthStatus != codexRefreshInvalidHealthStatus {
+		t.Fatalf("health_status=%q", loaded.HealthStatus)
+	}
+	if loaded.HealthError != codexRefreshInvalidHealthError {
+		t.Fatalf("health_error=%q", loaded.HealthError)
+	}
+	if !loaded.HealthCheckedAt.Equal(healthCheckedAt) {
+		t.Fatalf("health_checked_at=%v", loaded.HealthCheckedAt)
+	}
+	if !loaded.LastHealthyAt.Equal(lastHealthyAt) {
+		t.Fatalf("last_healthy_at=%v", loaded.LastHealthyAt)
+	}
+	if loaded.Dead {
+		t.Fatal("expected seat to stay non-dead")
+	}
+	if !loaded.DeadSince.IsZero() {
+		t.Fatalf("dead_since=%v", loaded.DeadSince)
+	}
+}
+
+func TestCodexProviderLoadsLegacyDeadOAuthAccountAsDeadHealth(t *testing.T) {
+	apiBase, _ := url.Parse("https://chatgpt.com")
+	provider := NewCodexProvider(apiBase, apiBase, apiBase, apiBase)
+
+	payload := []byte(`{
+	  "tokens": {
+	    "access_token": "seed-access",
+	    "refresh_token": "seed-refresh"
+	  },
+	  "dead": true
+	}`)
+
+	acc, err := provider.LoadAccount("legacy-dead.json", "/tmp/legacy-dead.json", payload)
+	if err != nil {
+		t.Fatalf("load account: %v", err)
+	}
+	if acc == nil {
+		t.Fatal("expected account")
+	}
+	if !acc.Dead {
+		t.Fatal("expected dead flag")
+	}
+	if acc.HealthStatus != "dead" {
+		t.Fatalf("health_status=%q", acc.HealthStatus)
+	}
+}
+
 func TestCodexProviderRefreshTokenLogsTrace(t *testing.T) {
 	refreshBase, _ := url.Parse("https://auth.openai.com")
 	provider := NewCodexProvider(refreshBase, refreshBase, refreshBase, refreshBase)
@@ -702,7 +787,7 @@ func TestCandidateSupportingPathAllowsAntigravityFallbackProjectForGeminiSeats(t
 		t.Fatalf("baseline candidate = %+v, want unsupported seat first", got)
 	}
 
-	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, path, "")
+	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, path, "gemini-2.5-flash", "")
 	if err != nil {
 		t.Fatalf("candidate supporting path: %v", err)
 	}
@@ -711,6 +796,54 @@ func TestCandidateSupportingPathAllowsAntigravityFallbackProjectForGeminiSeats(t
 	}
 	if got.ID != supported.ID {
 		t.Fatalf("candidate = %s, want %s", got.ID, supported.ID)
+	}
+}
+
+func TestCandidateSupportingPathSkipsGeminiSeatWhenRequestedModelCoolingDown(t *testing.T) {
+	now := time.Now().UTC()
+	coolingUntil := now.Add(2 * time.Minute)
+	cooling := &Account{
+		ID:                       "gemini_seat_cooling",
+		Type:                     AccountTypeGemini,
+		PlanType:                 "gemini",
+		OAuthProfileID:           geminiOAuthAntigravityProfileID,
+		AntigravitySource:        "browser_oauth",
+		AntigravityProjectID:     "project-1",
+		GeminiProviderCheckedAt:  now,
+		GeminiProviderTruthReady: true,
+		GeminiProviderTruthState: geminiProviderTruthStateReady,
+		GeminiModelRateLimitResetTimes: map[string]time.Time{
+			"gemini-3.1-pro-high": coolingUntil,
+		},
+	}
+	healthy := &Account{
+		ID:                       "gemini_seat_healthy",
+		Type:                     AccountTypeGemini,
+		PlanType:                 "gemini",
+		OAuthProfileID:           geminiOAuthAntigravityProfileID,
+		AntigravitySource:        "browser_oauth",
+		AntigravityProjectID:     "project-2",
+		GeminiProviderCheckedAt:  now,
+		GeminiProviderTruthReady: true,
+		GeminiProviderTruthState: geminiProviderTruthStateReady,
+	}
+	h := &proxyHandler{pool: newPoolState([]*Account{cooling, healthy}, false)}
+	provider := &GeminiProvider{}
+
+	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1beta/models/gemini-3.1-pro-high:generateContent", "gemini-3.1-pro", "")
+	if err != nil {
+		t.Fatalf("candidate supporting path: %v", err)
+	}
+	if got == nil || got.ID != healthy.ID {
+		t.Fatalf("candidate = %+v, want %s", got, healthy.ID)
+	}
+
+	got, err = h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1beta/models/gemini-2.5-flash:generateContent", "gemini-2.5-flash", "")
+	if err != nil {
+		t.Fatalf("flash candidate supporting path: %v", err)
+	}
+	if got == nil || got.ID != cooling.ID {
+		t.Fatalf("flash candidate = %+v, want %s", got, cooling.ID)
 	}
 }
 
@@ -734,7 +867,7 @@ func TestCandidateSupportingPathAllowsForcedDebugGeminiSeatForV1Internal(t *test
 	h := &proxyHandler{pool: pool}
 	provider := &GeminiProvider{}
 
-	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1internal:generateContent", blocked.ID)
+	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1internal:generateContent", "", blocked.ID)
 	if err != nil {
 		t.Fatalf("candidate supporting path: %v", err)
 	}
@@ -757,12 +890,165 @@ func TestCandidateSupportingPathAllowsForcedDebugGeminiSeatForAllowlistedBlocked
 	h := &proxyHandler{pool: pool}
 	provider := &GeminiProvider{}
 
-	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1beta/models/gemini-2.5-flash:generateContent", blocked.ID)
+	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1beta/models/gemini-2.5-flash:generateContent", "gemini-2.5-flash", blocked.ID)
 	if err != nil {
 		t.Fatalf("candidate supporting path: %v", err)
 	}
 	if got == nil || got.ID != blocked.ID {
 		t.Fatalf("candidate = %+v, want %s", got, blocked.ID)
+	}
+}
+
+func TestCandidateSupportingPathReturnsGitLabSharedTPMRateLimitError(t *testing.T) {
+	now := time.Now().UTC()
+	until := now.Add(45 * time.Second)
+	gitlabOne := &Account{
+		ID:              "claude_gitlab_one",
+		Type:            AccountTypeClaude,
+		PlanType:        "gitlab_duo",
+		AuthMode:        accountAuthModeGitLab,
+		AccessToken:     "gateway-1",
+		RefreshToken:    "glpat-1",
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders:    map[string]string{"X-Gitlab-Instance-Id": "inst-1"},
+		RateLimitUntil:  until,
+		HealthStatus:    "rate_limited",
+		HealthError:     managedGitLabClaudeSharedOrgTPMHealthError("This request would exceed your organization's rate limit of 18,000,000 input tokens per minute"),
+	}
+	gitlabTwo := &Account{
+		ID:              "claude_gitlab_two",
+		Type:            AccountTypeClaude,
+		PlanType:        "gitlab_duo",
+		AuthMode:        accountAuthModeGitLab,
+		AccessToken:     "gateway-2",
+		RefreshToken:    "glpat-2",
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders:    map[string]string{"X-Gitlab-Instance-Id": "inst-1"},
+		RateLimitUntil:  until,
+		HealthStatus:    "rate_limited",
+		HealthError:     managedGitLabClaudeSharedOrgTPMHealthError("This request would exceed your organization's rate limit of 18,000,000 input tokens per minute"),
+	}
+	baseURL, _ := url.Parse(defaultGitLabClaudeGatewayURL)
+	h := &proxyHandler{pool: newPoolState([]*Account{gitlabOne, gitlabTwo}, false)}
+	provider := NewClaudeProvider(baseURL)
+
+	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeClaude, "gitlab_duo", provider, "/v1/messages", "claude-opus-4-6", "")
+	if got != nil {
+		t.Fatalf("candidate = %+v, want nil", got)
+	}
+	rateLimitErr, ok := asRateLimitResponseError(err)
+	if !ok {
+		t.Fatalf("expected rate-limit error, got %v", err)
+	}
+	if !strings.Contains(rateLimitErr.Error(), "organization's rate limit") {
+		t.Fatalf("error=%q", rateLimitErr.Error())
+	}
+	if rateLimitErr.retryAfter <= 0 {
+		t.Fatalf("retry_after=%v", rateLimitErr.retryAfter)
+	}
+}
+
+func TestCandidateSupportingPathStillUsesDirectClaudeWhenGitLabSharedTPMActive(t *testing.T) {
+	now := time.Now().UTC()
+	gitlab := &Account{
+		ID:              "claude_gitlab_rate_limited",
+		Type:            AccountTypeClaude,
+		PlanType:        "gitlab_duo",
+		AuthMode:        accountAuthModeGitLab,
+		AccessToken:     "gateway-1",
+		RefreshToken:    "glpat-1",
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders:    map[string]string{"X-Gitlab-Instance-Id": "inst-1"},
+		RateLimitUntil:  now.Add(45 * time.Second),
+		HealthStatus:    "rate_limited",
+		HealthError:     managedGitLabClaudeSharedOrgTPMHealthError("This request would exceed your organization's rate limit of 18,000,000 input tokens per minute"),
+	}
+	direct := &Account{
+		ID:          "claude_direct_live",
+		Type:        AccountTypeClaude,
+		PlanType:    "claude",
+		AccessToken: "sk-ant-api-live",
+	}
+	baseURL, _ := url.Parse(defaultGitLabClaudeGatewayURL)
+	h := &proxyHandler{pool: newPoolState([]*Account{gitlab, direct}, false)}
+	provider := NewClaudeProvider(baseURL)
+
+	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeClaude, "", provider, "/v1/messages", "claude-opus-4-6", "")
+	if err != nil {
+		t.Fatalf("candidate supporting path: %v", err)
+	}
+	if got == nil || got.ID != direct.ID {
+		t.Fatalf("candidate = %+v, want %s", got, direct.ID)
+	}
+}
+
+func TestPropagateManagedGitLabClaudeSharedTPMCooldownOnlyTouchesMatchingEntitlementScope(t *testing.T) {
+	now := time.Now().UTC()
+	trigger := &Account{
+		ID:              "claude_gitlab_trigger",
+		Type:            AccountTypeClaude,
+		PlanType:        "gitlab_duo",
+		AuthMode:        accountAuthModeGitLab,
+		AccessToken:     "gateway-trigger",
+		RefreshToken:    "glpat-trigger",
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders: map[string]string{
+			"X-Gitlab-Instance-Id":                  "inst-1",
+			"X-Gitlab-Feature-Enabled-By-Namespace-Ids": "100,200",
+			"X-Gitlab-User-Id":                      "42",
+		},
+	}
+	sameScope := &Account{
+		ID:              "claude_gitlab_same_scope",
+		Type:            AccountTypeClaude,
+		PlanType:        "gitlab_duo",
+		AuthMode:        accountAuthModeGitLab,
+		AccessToken:     "gateway-same",
+		RefreshToken:    "glpat-same",
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders: map[string]string{
+			"X-Gitlab-Instance-Id":                  "inst-1",
+			"X-Gitlab-Feature-Enabled-By-Namespace-Ids": "100,200",
+			"X-Gitlab-User-Id":                      "77",
+		},
+	}
+	otherScope := &Account{
+		ID:              "claude_gitlab_other_scope",
+		Type:            AccountTypeClaude,
+		PlanType:        "gitlab_duo",
+		AuthMode:        accountAuthModeGitLab,
+		AccessToken:     "gateway-other",
+		RefreshToken:    "glpat-other",
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders: map[string]string{
+			"X-Gitlab-Instance-Id":                  "inst-1",
+			"X-Gitlab-Feature-Enabled-By-Namespace-Ids": "300",
+			"X-Gitlab-User-Id":                      "42",
+		},
+	}
+	h := &proxyHandler{pool: newPoolState([]*Account{trigger, sameScope, otherScope}, false)}
+	disposition := managedGitLabClaudeErrorDisposition{
+		RateLimit:    true,
+		SharedOrgTPM: true,
+		HealthStatus: "rate_limited",
+		Cooldown:     managedGitLabClaudeOrgTPMRateLimitWait,
+		Reason:       "This request would exceed your organization's rate limit of 18,000,000 input tokens per minute",
+	}
+
+	if !h.propagateManagedGitLabClaudeSharedTPMCooldown("req-test", trigger, disposition, http.Header{}, "claude-opus-4-6", now) {
+		t.Fatal("expected propagation to affect matching entitlement scope")
+	}
+	if trigger.RateLimitUntil.IsZero() || sameScope.RateLimitUntil.IsZero() {
+		t.Fatal("expected matching entitlement scope seats to receive cooldown")
+	}
+	if !otherScope.RateLimitUntil.IsZero() {
+		t.Fatalf("expected other entitlement scope to stay clear, got %v", otherScope.RateLimitUntil)
 	}
 }
 
@@ -780,7 +1066,7 @@ func TestCandidateSupportingPathRejectsForcedDebugGeminiSeatForUnsupportedBlocke
 	h := &proxyHandler{pool: pool}
 	provider := &GeminiProvider{}
 
-	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1beta/models/gemini-2.5-flash:generateContent", blocked.ID)
+	got, err := h.candidateSupportingPath("", map[string]bool{}, AccountTypeGemini, "", provider, "/v1beta/models/gemini-2.5-flash:generateContent", "gemini-2.5-flash", blocked.ID)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -957,6 +1243,38 @@ func TestFinalizeWebSocketSuccessStateRecoversManagedAPIAccountOnNonSwitching2xx
 	}
 }
 
+func TestFinalizeWebSocketSuccessStatePersistsRuntimeLastUsed(t *testing.T) {
+	store, err := newUsageStore(filepath.Join(t.TempDir(), "usage.db"), 7)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	acc := &Account{
+		ID:       "seat-ws",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.12,
+			SecondaryUsedPercent: 0.18,
+			PrimaryResetAt:       time.Now().Add(time.Hour),
+			SecondaryResetAt:     time.Now().Add(12 * time.Hour),
+		},
+	}
+	h := &proxyHandler{store: store}
+
+	h.finalizeWebSocketSuccessState(acc, "", http.StatusSwitchingProtocols)
+
+	restored := &Account{ID: "seat-ws", Type: AccountTypeCodex}
+	_, _, _, restoredRuntime := restorePersistedUsageState([]*Account{restored}, store)
+	if restoredRuntime != 1 {
+		t.Fatalf("restoredRuntime=%d", restoredRuntime)
+	}
+	if restored.LastUsed.IsZero() {
+		t.Fatal("expected LastUsed to be restored from runtime store")
+	}
+}
+
 func TestFinalizeWebSocketSuccessStateSkipsFailedHandshake(t *testing.T) {
 	acc := &Account{
 		ID:             "openai_api_deadbeef",
@@ -996,6 +1314,50 @@ func TestFinalizeWebSocketSuccessStateSkipsFailedHandshake(t *testing.T) {
 	}
 	if acc.RateLimitUntil.IsZero() {
 		t.Fatal("expected rate limit state to remain unchanged")
+	}
+}
+
+func TestFinalizeProxyResponsePersistsRuntimeLastUsed(t *testing.T) {
+	store, err := newUsageStore(filepath.Join(t.TempDir(), "usage.db"), 7)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	acc := &Account{
+		ID:       "seat-buffered",
+		Type:     AccountTypeCodex,
+		PlanType: "team",
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.11,
+			SecondaryUsedPercent: 0.17,
+			PrimaryResetAt:       time.Now().Add(time.Hour),
+			SecondaryResetAt:     time.Now().Add(12 * time.Hour),
+		},
+	}
+	h := &proxyHandler{store: store}
+
+	h.finalizeProxyResponse(
+		"req-test",
+		nil,
+		acc,
+		"user-1",
+		http.StatusOK,
+		true,
+		false,
+		"",
+		0,
+		0,
+		nil,
+	)
+
+	restored := &Account{ID: "seat-buffered", Type: AccountTypeCodex}
+	_, _, _, restoredRuntime := restorePersistedUsageState([]*Account{restored}, store)
+	if restoredRuntime != 1 {
+		t.Fatalf("restoredRuntime=%d", restoredRuntime)
+	}
+	if restored.LastUsed.IsZero() {
+		t.Fatal("expected LastUsed to be restored from runtime store")
 	}
 }
 
@@ -1121,6 +1483,8 @@ func TestApplyPreCopyUpstreamStatusDispositionManaged5xxRecordsFallbackAndHealth
 		resp,
 		false,
 		[]byte(`{"error":{"message":"server boom"}}`),
+		"",
+		"",
 	)
 
 	if err == nil || err.Error() != "managed api fallback 502 Bad Gateway: server boom" {
@@ -1167,6 +1531,8 @@ func TestApplyPreCopyUpstreamStatusDispositionMarksPermanentCodexAuthFailureDead
 		resp,
 		false,
 		[]byte(`{"error":"account_deactivated"}`),
+		"",
+		"",
 	)
 
 	if err != nil {
@@ -1177,6 +1543,15 @@ func TestApplyPreCopyUpstreamStatusDispositionMarksPermanentCodexAuthFailureDead
 	}
 	if acc.Penalty != 100.0 {
 		t.Fatalf("penalty = %v", acc.Penalty)
+	}
+	if acc.HealthStatus != "dead" {
+		t.Fatalf("health_status=%q", acc.HealthStatus)
+	}
+	if acc.HealthError != "codex upstream account_deactivated" {
+		t.Fatalf("health_error=%q", acc.HealthError)
+	}
+	if acc.HealthCheckedAt.IsZero() {
+		t.Fatal("expected health_checked_at to be set")
 	}
 }
 
@@ -1197,6 +1572,8 @@ func TestApplyPreCopyUpstreamStatusDispositionRefreshFailedMarksNonCodexDead(t *
 		resp,
 		true,
 		[]byte(`{"error":"refresh failed"}`),
+		"",
+		"",
 	)
 
 	if err != nil {
@@ -1228,6 +1605,8 @@ func TestApplyPreCopyUpstreamStatusDispositionNonManaged429AppliesRateLimitPenal
 		resp,
 		false,
 		nil,
+		"",
+		"",
 	)
 
 	if err != nil {
@@ -1238,6 +1617,103 @@ func TestApplyPreCopyUpstreamStatusDispositionNonManaged429AppliesRateLimitPenal
 	}
 	if acc.RateLimitUntil.IsZero() {
 		t.Fatal("expected RateLimitUntil to be set")
+	}
+}
+
+func TestApplyPreCopyUpstreamStatusDispositionTracksGeminiModelCooldownWithoutSeatWideCooldown(t *testing.T) {
+	acc := &Account{
+		ID:                       "gemini-1",
+		Type:                     AccountTypeGemini,
+		PlanType:                 "gemini",
+		OAuthProfileID:           geminiOAuthAntigravityProfileID,
+		AntigravitySource:        "browser_oauth",
+		AntigravityProjectID:     "project-1",
+		GeminiProviderCheckedAt:  time.Now().UTC(),
+		GeminiProviderTruthReady: true,
+		GeminiProviderTruthState: geminiProviderTruthStateReady,
+	}
+	h := &proxyHandler{}
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     "429 Too Many Requests",
+		Header:     http.Header{},
+	}
+	resetAt := time.Now().UTC().Add(5 * time.Minute).Truncate(time.Second)
+
+	err := h.applyPreCopyUpstreamStatusDisposition(
+		"req-test",
+		acc,
+		resp,
+		false,
+		[]byte(`{"error":{"message":"model quota exhausted","details":[{"metadata":{"quotaResetTimeStamp":"`+resetAt.Format(time.RFC3339)+`"}}]}}`),
+		"gemini-3.1-pro",
+		"/v1beta/models/gemini-3.1-pro-high:generateContent",
+	)
+
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if !acc.RateLimitUntil.IsZero() {
+		t.Fatalf("expected seat-wide cooldown to stay clear, got %v", acc.RateLimitUntil)
+	}
+	if acc.Penalty != 1.0 {
+		t.Fatalf("penalty = %v", acc.Penalty)
+	}
+	if acc.GeminiOperationalState != geminiOperationalTruthStateCooldown {
+		t.Fatalf("operational_state = %q", acc.GeminiOperationalState)
+	}
+	if acc.GeminiOperationalSource != "proxy" {
+		t.Fatalf("operational_source = %q", acc.GeminiOperationalSource)
+	}
+	if got := acc.GeminiModelRateLimitResetTimes["gemini-3.1-pro-high"]; !got.Equal(resetAt) {
+		t.Fatalf("model reset time = %v", got)
+	}
+}
+
+func TestApplyPreCopyUpstreamStatusDispositionUsesManagedGeminiFallbackCooldownForBare429(t *testing.T) {
+	acc := &Account{
+		ID:                       "gemini-fallback-429",
+		Type:                     AccountTypeGemini,
+		PlanType:                 "gemini",
+		OAuthProfileID:           geminiOAuthAntigravityProfileID,
+		AntigravitySource:        "browser_oauth",
+		AntigravityProjectID:     "project-1",
+		GeminiProviderCheckedAt:  time.Now().UTC(),
+		GeminiProviderTruthReady: true,
+		GeminiProviderTruthState: geminiProviderTruthStateReady,
+	}
+	h := &proxyHandler{}
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     "429 Too Many Requests",
+		Header:     http.Header{},
+	}
+	before := time.Now().UTC()
+
+	err := h.applyPreCopyUpstreamStatusDisposition(
+		"req-test",
+		acc,
+		resp,
+		false,
+		nil,
+		"gemini-3.1-pro-high",
+		"/v1beta/models/gemini-3.1-pro-high:generateContent",
+	)
+
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	until := acc.GeminiModelRateLimitResetTimes["gemini-3.1-pro-high"]
+	if until.IsZero() {
+		t.Fatalf("GeminiModelRateLimitResetTimes = %#v", acc.GeminiModelRateLimitResetTimes)
+	}
+	wait := until.Sub(before)
+	if wait < managedGeminiRateLimitWait-2*time.Second || wait > managedGeminiRateLimitWait+2*time.Second {
+		t.Fatalf("wait = %v, want about %v", wait, managedGeminiRateLimitWait)
 	}
 }
 
@@ -1256,6 +1732,8 @@ func TestApplyPreCopyUpstreamStatusDispositionTransientCodexAuthAddsPenalty(t *t
 		resp,
 		false,
 		[]byte(`{"error":"temporary denied"}`),
+		"",
+		"",
 	)
 
 	if err != nil {
@@ -1309,6 +1787,8 @@ func TestApplyPreCopyUpstreamStatusDispositionGitLabQuotaExceededMarksDead(t *te
 		resp,
 		false,
 		[]byte(`{"error":"insufficient_credits","error_code":"USAGE_QUOTA_EXCEEDED"}`),
+		"",
+		"",
 	)
 
 	if err != nil {
@@ -1403,6 +1883,8 @@ func TestApplyPreCopyUpstreamStatusDispositionPreservesDeadGitLabAccount(t *test
 		resp,
 		true,
 		[]byte(`{"error":"temporary denied"}`),
+		"",
+		"",
 	)
 	if err != nil {
 		t.Fatalf("err = %v", err)

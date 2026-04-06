@@ -8,9 +8,9 @@ import (
 )
 
 const (
-	openCodeAntigravityProviderID   = "antigravity-manager"
+	openCodeAntigravityProviderID   = "codex-pool"
 	openCodeConfigFileName          = "opencode.json"
-	openCodeAntigravityAccountsFile = "antigravity-accounts.json"
+	openCodeAntigravityAccountsFile = "pool-gemini-accounts.json"
 )
 
 type openCodePluginAccount struct {
@@ -43,7 +43,7 @@ type openCodeConfigBundle struct {
 	ConfigFile          string                     `json:"config_file"`
 	AccountsFile        string                     `json:"accounts_file"`
 	OpenCodeConfig      map[string]any             `json:"opencode_config"`
-	AntigravityAccounts openCodePluginAccountsFile `json:"antigravity_accounts"`
+	AntigravityAccounts openCodePluginAccountsFile `json:"pool_gemini_accounts"`
 }
 
 func normalizeOpenCodeBaseURL(input string) string {
@@ -62,8 +62,35 @@ func defaultOpenCodeProviderModels() map[string]any {
 		"gemini-2.5-flash": map[string]any{
 			"name": "Gemini 2.5 Flash",
 		},
+		"gemini-2.5-flash-lite": map[string]any{
+			"name": "Gemini 2.5 Flash Lite",
+		},
+		"gemini-2.5-flash-thinking": map[string]any{
+			"name": "Gemini 2.5 Flash Thinking",
+		},
+		"gemini-2.5-pro": map[string]any{
+			"name": "Gemini 2.5 Pro",
+		},
 		"gemini-3-flash": map[string]any{
 			"name": "Gemini 3 Flash",
+		},
+		"gemini-3-flash-agent": map[string]any{
+			"name": "Gemini 3 Flash Agent",
+		},
+		"gemini-3-pro-high": map[string]any{
+			"name": "Gemini 3 Pro High",
+		},
+		"gemini-3-pro-low": map[string]any{
+			"name": "Gemini 3 Pro Low",
+		},
+		"gemini-3-pro-preview": map[string]any{
+			"name": "Gemini 3 Pro Preview",
+		},
+		"gemini-3.1-flash-image": map[string]any{
+			"name": "Gemini 3.1 Flash Image",
+		},
+		"gemini-3.1-flash-lite": map[string]any{
+			"name": "Gemini 3.1 Flash Lite",
 		},
 		"gemini-3.1-pro": map[string]any{
 			"name": "Gemini 3.1 Pro",
@@ -85,12 +112,13 @@ func mergeOpenCodeProviderModelMetadata(models map[string]any, model GeminiModel
 	if name == "" {
 		return
 	}
+	_, knownModel := models[name]
 	existing, _ := models[name].(map[string]any)
 	if existing == nil {
 		existing = map[string]any{}
 		models[name] = existing
 	}
-	if strings.TrimSpace(model.DisplayName) != "" {
+	if strings.TrimSpace(model.DisplayName) != "" && !knownModel {
 		existing["name"] = strings.TrimSpace(model.DisplayName)
 	} else if _, ok := existing["name"]; !ok {
 		existing["name"] = name
@@ -153,12 +181,12 @@ func buildOpenCodeConfigDocument(baseURL, apiKey string, models map[string]any) 
 	}
 	return map[string]any{
 		"$schema": "https://opencode.ai/config.json",
-		"model":   openCodeAntigravityProviderID + "/gemini-3.1-pro",
+		"model":   openCodeAntigravityProviderID + "/gemini-3.1-flash-lite",
 		"provider": map[string]any{
 			openCodeAntigravityProviderID: map[string]any{
 				// OpenCode reaches this local Gemini pool over its Anthropic-compatible transport.
 				"npm":  "@ai-sdk/anthropic",
-				"name": "Antigravity Manager",
+				"name": "Codex Pool Gemini",
 				"options": map[string]any{
 					"baseURL": normalizeOpenCodeBaseURL(baseURL),
 					"apiKey":  apiKey,
@@ -201,6 +229,18 @@ func buildOpenCodeCachedQuota(snapshot accountSnapshot) map[string]any {
 	}
 	if len(snapshot.GeminiProtectedModels) > 0 {
 		quota["protected_models"] = normalizeStringSlice(snapshot.GeminiProtectedModels)
+	}
+	if len(snapshot.GeminiModelRateLimitResetTimes) > 0 {
+		resetTimes := make(map[string]int64, len(snapshot.GeminiModelRateLimitResetTimes))
+		for model, resetAt := range snapshot.GeminiModelRateLimitResetTimes {
+			if resetAt.IsZero() {
+				continue
+			}
+			resetTimes[model] = resetAt.UTC().UnixMilli()
+		}
+		if len(resetTimes) > 0 {
+			quota["rate_limit_reset_times"] = resetTimes
+		}
 	}
 	if len(snapshot.GeminiQuotaModels) > 0 {
 		models := make([]map[string]any, 0, len(snapshot.GeminiQuotaModels))
@@ -381,6 +421,18 @@ func buildOpenCodeAntigravityAccounts(h *proxyHandler) openCodePluginAccountsFil
 		}
 		if !snapshot.GeminiQuotaUpdatedAt.IsZero() {
 			account.CachedQuotaUpdated = snapshot.GeminiQuotaUpdatedAt.UTC().UnixMilli()
+		}
+		if len(snapshot.GeminiModelRateLimitResetTimes) > 0 {
+			account.RateLimitResetTimes = make(map[string]int64, len(snapshot.GeminiModelRateLimitResetTimes))
+			for model, resetAt := range snapshot.GeminiModelRateLimitResetTimes {
+				if resetAt.IsZero() {
+					continue
+				}
+				account.RateLimitResetTimes[model] = resetAt.UTC().UnixMilli()
+			}
+			if len(account.RateLimitResetTimes) == 0 {
+				account.RateLimitResetTimes = nil
+			}
 		}
 		if snapshot.RateLimitUntil.After(now) {
 			account.CoolingDownUntil = snapshot.RateLimitUntil.UTC().UnixMilli()

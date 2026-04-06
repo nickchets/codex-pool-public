@@ -4,7 +4,7 @@ Pool your accounts. Share with friends. Never swap credentials again.
 
 A reverse proxy that distributes your Agent (Codex/Claude/Gemini) sessions across multiple accounts. Got three Codex accounts? Five Claude logins? The proxy spreads your usage across all of them automatically - no manual switching, no juggling auth files.
 
-Works with **Codex CLI**, **Claude Code**, **Gemini CLI**, and now a dedicated **Gemini-only OpenCode Antigravity export** surface.
+Works with **Codex CLI**, **Claude Code**, and **OpenCode** as the canonical Gemini path through the pool.
 
 ---
 
@@ -21,7 +21,7 @@ Or maybe you want to pool accounts with friends - everyone throws their accounts
 - Auto-refreshes tokens before they expire
 - Proxies WebSocket upgrades (including Codex Responses WS and realtime `/ws` flows)
 - Tracks usage so you can see who's burning through quota
-- Exposes a dashboard-first operator surface on `/` and `/status`
+- Exposes a dashboard-first operator surface on `/` plus read-only diagnostics on `/status`
 
 ---
 
@@ -30,10 +30,11 @@ Or maybe you want to pool accounts with friends - everyone throws their accounts
 The operator UI is dashboard-first:
 
 - `/` shows live `Codex`, `Claude`, and `Gemini` dashboards
-- `/status` exposes the raw operator dashboard and JSON status contract
+- `/status` exposes the read-only diagnostics surface and JSON status contract
 - account onboarding and delete actions are available from the web surface
 - fallback API keys and GitLab Claude tokens are managed from the same operator surface
-- Gemini seat onboarding on `/` and `/status` is browser-first via Antigravity auth
+- Gemini seat onboarding starts from `/` via the shared pool auth flow; `/status` stays diagnostics-only
+- OpenCode via a pool-backed Gemini default is the canonical client path after seat onboarding; the exported provider keeps a safer default on `codex-pool/gemini-3.1-flash-lite`, while still surfacing `gemini-3.1-pro-high`, `gemini-3.1-pro-low`, and other live quota-backed Gemini models when available
 - older local/manual Gemini import paths are intentionally not exposed on the operator surface anymore
 
 Friends mode still exists, but the local documentation and operator flow are intentionally text-first and dashboard-first instead of screenshot-driven.
@@ -67,15 +68,9 @@ pool/
 
 For Gemini seats, use the operator dashboard:
 
-1. Open `http://<pool-host>/` or `http://<pool-host>/status`
-2. In the Gemini operator panel, click `Start Antigravity Gemini Auth`
+1. Open `http://<pool-host>/`
+2. In the Gemini operator panel, click `Start Gemini Browser Auth`
 3. Complete Google sign-in; the dashboard resolves the Code Assist project and stores the seat through the shared Gemini pool
-
-Optional Antigravity refresh fallback secret, if Google requires it in your environment:
-
-```bash
-export ANTIGRAVITY_GEMINI_OAUTH_CLIENT_SECRET=...
-```
 
 ### 2. Run it
 
@@ -103,18 +98,7 @@ export ANTHROPIC_BASE_URL="http://<pool-host>"
 export ANTHROPIC_API_KEY="pool"
 ```
 
-**Gemini CLI**:
-```bash
-# Preferred path: use the tokenized `/setup/gemini/...` URL emitted for your pool user.
-# If you wire Gemini CLI manually, use a generated synthetic pool key (AIzaSy-pool-...),
-# not the literal string "pool".
-export GEMINI_API_KEY="AIzaSy-pool-..."
-export GOOGLE_GEMINI_BASE_URL="http://<pool-host>"
-```
-
-The tokenized `/setup/gemini/...` installer URL is the preferred path. It keeps Gemini CLI in external API-key mode, writes the same pool-facing client configuration for you, and pins the client to the pool root URL instead of `/v1`.
-
-**OpenCode (Gemini via pool)**:
+**OpenCode (canonical Gemini path via pool)**:
 
 - Recommended path: the tokenized `/setup/opencode/...` URL emitted for that pool user
 - Raw export bundle: the tokenized `/config/opencode/...` URL emitted for that pool user
@@ -124,10 +108,12 @@ Recommended day-one flow:
 ```bash
 # 1. Open the real per-user /setup/opencode/... URL emitted by the pool.
 # 2. Run the returned installer script.
-opencode run -m antigravity-manager/gemini-3.1-pro "Reply with exactly OK."
+opencode run -m codex-pool/gemini-3.1-flash-lite "Reply with exactly OK."
 ```
 
-The setup URL writes `~/.config/opencode/opencode.json` plus `~/.config/opencode/antigravity-accounts.json`, keeps the proxy base URL normalized to `/v1`, and exports `model = antigravity-manager/gemini-3.1-pro`. This is still Gemini through the pool, not a Claude provider switch.
+The setup URL writes `~/.config/opencode/opencode.json` plus `~/.config/opencode/pool-gemini-accounts.json`, keeps the proxy base URL normalized to `/v1`, and exports `model = codex-pool/gemini-3.1-flash-lite`. This is still Gemini through the pool, not a Claude provider switch.
+
+The default favors `codex-pool/gemini-3.1-flash-lite` because it is the most reliable local operator path during seat cooldown churn, but the exported provider model catalog still includes `gemini-3.1-pro-high`, `gemini-3.1-pro-low`, and the broader live Gemini quota surface from the pool so OpenCode can stay aligned with what the runtime actually exposes.
 
 The tokenized `/setup/opencode/...` URL returns an installer script. If you want the raw JSON bundle instead, use the matching tokenized `/config/opencode/...` URL.
 
@@ -147,7 +133,7 @@ Important operator-facing states:
 - `enabled`: clean fresh-routing path.
 - `degraded_enabled`: the seat is still eligible for fresh routing, but only under provider or operational caveats.
 - `cooldown`: a short rate-limit reset window after a `429`; wait for `routing.recovery_at` or rerun seat smoke instead of deleting the seat immediately.
-- `missing_project_id`: provider truth exists, but project resolution is incomplete, so the seat is blocked.
+- `missing_project_id`: provider truth exists, but project resolution is incomplete; browser-auth Gemini seats stay blocked until they have warmed fallback-project proof, after which routing can keep them in `degraded_enabled`.
 - `stale_quota_snapshot` or `stale_provider_truth`: refresh debt, not automatic proof that the account is dead.
 
 Manual Gemini seat smoke:
@@ -201,6 +187,7 @@ Environment variable `PROXY_MAX_INMEM_BODY_BYTES` controls how large a request b
 This repository also includes generic deployment assets for self-hosted installs:
 
 - `systemd/codex-pool.service`
+- `systemd/codex-pool-gitlab.service`
 - `docs/install.md`
 - `docs/upstream-delta.md`
 - `CHANGELOG.md`
@@ -217,7 +204,9 @@ curl -fsS http://<pool-host>/status?format=json | jq .
 systemctl --user status codex-pool.service --no-pager
 ```
 
-The preferred add-account path is the `/` or `/status` web button. The `/` page is intended to be an operator dashboard, not a decorative landing page.
+The preferred add-account path is the `/` web surface. `/status` is intentionally diagnostics-only, while `/` stays the operator dashboard rather than a decorative landing page.
+
+If you need an isolated GitLab Codex-only CLI lane, `docs/install.md` also documents the optional `clcode` sidecar path on a separate runtime and port.
 
 Current tracked version is stored in `VERSION`. Fork-specific release history lives in
 `CHANGELOG.md`, and version bump rules live in `VERSIONING.md`.

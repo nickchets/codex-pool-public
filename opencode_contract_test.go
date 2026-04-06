@@ -68,7 +68,7 @@ func TestBuildOpenCodeConfigBundle(t *testing.T) {
 	if bundle.ProviderID != openCodeAntigravityProviderID {
 		t.Fatalf("provider_id = %q", bundle.ProviderID)
 	}
-	if got, _ := bundle.OpenCodeConfig["model"].(string); got != "antigravity-manager/gemini-3.1-pro" {
+	if got, _ := bundle.OpenCodeConfig["model"].(string); got != "codex-pool/gemini-3.1-flash-lite" {
 		t.Fatalf("model = %q", got)
 	}
 	if bundle.BaseURL != "http://pool.local/v1" {
@@ -89,6 +89,27 @@ func TestBuildOpenCodeConfigBundle(t *testing.T) {
 		t.Fatalf("apiKey mismatch")
 	}
 	models := provider["models"].(map[string]any)
+	for _, want := range []string{
+		"gemini-2.5-flash",
+		"gemini-2.5-flash-lite",
+		"gemini-2.5-flash-thinking",
+		"gemini-2.5-pro",
+		"gemini-3-flash",
+		"gemini-3-flash-agent",
+		"gemini-3-pro-high",
+		"gemini-3-pro-low",
+		"gemini-3-pro-preview",
+		"gemini-3.1-flash-image",
+		"gemini-3.1-flash-lite",
+		"gemini-3.1-pro",
+		"gemini-3.1-pro-high",
+		"gemini-3.1-pro-low",
+		"gemini-3.1-pro-preview",
+	} {
+		if _, ok := models[want]; !ok {
+			t.Fatalf("models missing %q: %#v", want, models)
+		}
+	}
 	model := models["claude-3-7-sonnet"].(map[string]any)
 	if model["name"] != "Claude via Gemini" {
 		t.Fatalf("model.name = %#v", model["name"])
@@ -145,6 +166,54 @@ func TestBuildOpenCodeConfigBundle(t *testing.T) {
 	}
 	if got := account.CachedQuota["provider_checked_at"]; got != now.Unix() {
 		t.Fatalf("cached_quota.provider_checked_at = %#v", got)
+	}
+}
+
+func TestBuildOpenCodeConfigBundleKeepsCanonicalNamesForKnownGeminiModels(t *testing.T) {
+	t.Setenv("POOL_JWT_SECRET", "test-secret-0123456789abcdef0123456789abcdef")
+
+	now := time.Date(2026, time.March, 29, 12, 0, 0, 0, time.UTC)
+	h := &proxyHandler{
+		pool: newPoolState([]*Account{
+			{
+				ID:                      "gemini-seat-1",
+				Type:                    AccountTypeGemini,
+				RefreshToken:            "refresh-1",
+				OperatorEmail:           "seat@example.com",
+				AntigravityProjectID:    "project-1",
+				GeminiProviderCheckedAt: now,
+				GeminiQuotaModels: []GeminiModelQuotaSnapshot{
+					{
+						Name:        "gemini-2.5-flash",
+						DisplayName: "Gemini 3.1 Flash Lite",
+					},
+					{
+						Name:        "gemini-3-flash-agent",
+						DisplayName: "Gemini 3 Flash",
+					},
+				},
+			},
+		}, false),
+	}
+	user := &PoolUser{
+		ID:       "pool-user-1234",
+		Token:    "download-token",
+		Email:    "pool@example.com",
+		PlanType: "pro",
+	}
+	req := httptest.NewRequest("GET", "http://pool.local/config/opencode/download-token", nil)
+
+	bundle, err := h.buildOpenCodeConfigBundle(req, user, getPoolJWTSecret())
+	if err != nil {
+		t.Fatalf("buildOpenCodeConfigBundle: %v", err)
+	}
+	provider := bundle.OpenCodeConfig["provider"].(map[string]any)[openCodeAntigravityProviderID].(map[string]any)
+	models := provider["models"].(map[string]any)
+	if got := models["gemini-2.5-flash"].(map[string]any)["name"]; got != "Gemini 2.5 Flash" {
+		t.Fatalf("gemini-2.5-flash name = %#v", got)
+	}
+	if got := models["gemini-3-flash-agent"].(map[string]any)["name"]; got != "Gemini 3 Flash Agent" {
+		t.Fatalf("gemini-3-flash-agent name = %#v", got)
 	}
 }
 
@@ -428,6 +497,150 @@ func TestBuildOpenCodeConfigBundleExportsGeminiCooldownState(t *testing.T) {
 	}
 	if account.CachedQuota["routing_block_reason"] != "rate_limited" {
 		t.Fatalf("cached_quota = %#v", account.CachedQuota)
+	}
+}
+
+func TestBuildOpenCodeConfigBundleExportsGeminiModelRateLimitResetTimes(t *testing.T) {
+	t.Setenv("POOL_JWT_SECRET", "test-secret-0123456789abcdef0123456789abcdef")
+
+	now := time.Now().UTC()
+	resetAt := now.Add(3 * time.Minute).Truncate(time.Second)
+	h := &proxyHandler{
+		pool: newPoolState([]*Account{
+			{
+				ID:                       "gemini-seat-model-cooldown",
+				Type:                     AccountTypeGemini,
+				RefreshToken:             "refresh-model-cooldown",
+				OperatorEmail:            "model-cooldown@example.com",
+				AntigravityProjectID:     "project-model-cooldown",
+				GeminiProviderCheckedAt:  now,
+				GeminiProviderTruthReady: true,
+				GeminiProviderTruthState: geminiProviderTruthStateReady,
+				GeminiOperationalState:   geminiOperationalTruthStateCooldown,
+				GeminiModelRateLimitResetTimes: map[string]time.Time{
+					"gemini-3.1-pro-high": resetAt,
+				},
+			},
+		}, false),
+	}
+	user := &PoolUser{
+		ID:       "pool-user-1234",
+		Token:    "download-token",
+		Email:    "pool@example.com",
+		PlanType: "pro",
+	}
+	req := httptest.NewRequest("GET", "http://pool.local/config/opencode/download-token", nil)
+
+	bundle, err := h.buildOpenCodeConfigBundle(req, user, getPoolJWTSecret())
+	if err != nil {
+		t.Fatalf("buildOpenCodeConfigBundle: %v", err)
+	}
+	account := bundle.AntigravityAccounts.Accounts[0]
+	if account.Enabled == nil || !*account.Enabled {
+		t.Fatalf("enabled = %#v", account.Enabled)
+	}
+	if account.CoolingDownUntil != 0 {
+		t.Fatalf("cooling_down_until = %d", account.CoolingDownUntil)
+	}
+	if account.LastSwitchReason != routingDisplayStateDegradedEnabled {
+		t.Fatalf("last_switch_reason = %q", account.LastSwitchReason)
+	}
+	if !strings.Contains(account.CooldownReason, "gemini-3.1-pro-high") {
+		t.Fatalf("cooldown_reason = %q", account.CooldownReason)
+	}
+	if account.RateLimitResetTimes["gemini-3.1-pro-high"] != resetAt.UnixMilli() {
+		t.Fatalf("rate_limit_reset_times = %#v", account.RateLimitResetTimes)
+	}
+	resetTimes, _ := account.CachedQuota["rate_limit_reset_times"].(map[string]int64)
+	if resetTimes["gemini-3.1-pro-high"] != resetAt.UnixMilli() {
+		t.Fatalf("cached_quota = %#v", account.CachedQuota)
+	}
+	cachedModels := account.CachedQuota["models"].([]map[string]any)
+	if len(cachedModels) != 1 {
+		t.Fatalf("cached_quota.models = %#v", cachedModels)
+	}
+	if cachedModels[0]["name"] != "gemini-3.1-pro-high" || cachedModels[0]["percentage"] != 100 || cachedModels[0]["reset_time"] != resetAt.Format(time.RFC3339) {
+		t.Fatalf("cached model = %#v", cachedModels[0])
+	}
+	if account.CachedQuota["routing_state"] != routingDisplayStateDegradedEnabled {
+		t.Fatalf("cached_quota = %#v", account.CachedQuota)
+	}
+	if got := account.CachedQuota["routing_reason"]; got == nil || !strings.Contains(got.(string), "gemini-3.1-pro-high") {
+		t.Fatalf("routing_reason = %#v", got)
+	}
+}
+
+func TestBuildOpenCodeConfigBundleExportsWarmedMissingProjectGeminiAsRoutable(t *testing.T) {
+	t.Setenv("POOL_JWT_SECRET", "test-secret-0123456789abcdef0123456789abcdef")
+
+	now := time.Now().UTC()
+	h := &proxyHandler{
+		pool: newPoolState([]*Account{
+			{
+				ID:                      "gemini-seat-missing-project",
+				Type:                    AccountTypeGemini,
+				RefreshToken:            "refresh-missing-project",
+				OperatorEmail:           "missing-project@example.com",
+				OperatorSource:          geminiOperatorSourceAntigravityImport,
+				OAuthProfileID:          geminiOAuthAntigravityProfileID,
+				GeminiProviderCheckedAt: now,
+				GeminiQuotaUpdatedAt:    now,
+				GeminiOperationalState:  geminiOperationalTruthStateDegradedOK,
+				GeminiOperationalReason: "operator smoke succeeded via fallback project",
+				GeminiQuotaModels: []GeminiModelQuotaSnapshot{{
+					Name:          "gemini-3.1-pro-high",
+					RouteProvider: "gemini",
+					Percentage:    81,
+				}},
+			},
+		}, false),
+	}
+	user := &PoolUser{
+		ID:       "pool-user-1234",
+		Token:    "download-token",
+		Email:    "pool@example.com",
+		PlanType: "pro",
+	}
+	req := httptest.NewRequest("GET", "http://pool.local/config/opencode/download-token", nil)
+
+	bundle, err := h.buildOpenCodeConfigBundle(req, user, getPoolJWTSecret())
+	if err != nil {
+		t.Fatalf("buildOpenCodeConfigBundle: %v", err)
+	}
+	account := bundle.AntigravityAccounts.Accounts[0]
+	if account.Enabled == nil || !*account.Enabled {
+		t.Fatalf("enabled = %#v", account.Enabled)
+	}
+	if account.ProjectID != "" || account.ManagedProjectID != "" {
+		t.Fatalf("project fields = %#v", account)
+	}
+	if _, ok := account.CachedQuota["project_id"]; ok {
+		t.Fatalf("cached_quota = %#v", account.CachedQuota)
+	}
+	if account.LastSwitchReason != routingDisplayStateDegradedEnabled {
+		t.Fatalf("last_switch_reason = %q", account.LastSwitchReason)
+	}
+	if !strings.Contains(account.CooldownReason, "fallback project") {
+		t.Fatalf("cooldown_reason = %q", account.CooldownReason)
+	}
+	cachedModels := account.CachedQuota["models"].([]map[string]any)
+	if len(cachedModels) != 1 {
+		t.Fatalf("cached_quota.models = %#v", cachedModels)
+	}
+	if cachedModels[0]["routable"] != true {
+		t.Fatalf("cached model = %#v", cachedModels[0])
+	}
+	if got := cachedModels[0]["compatibility_reason"]; got != nil && got != "" {
+		t.Fatalf("cached model = %#v", cachedModels[0])
+	}
+	if account.CachedQuota["provider_truth_state"] != geminiProviderTruthStateMissingProjectID {
+		t.Fatalf("cached_quota = %#v", account.CachedQuota)
+	}
+	if account.CachedQuota["routing_state"] != routingDisplayStateDegradedEnabled {
+		t.Fatalf("cached_quota = %#v", account.CachedQuota)
+	}
+	if got := account.CachedQuota["routing_reason"]; got == nil || !strings.Contains(got.(string), "fallback project") {
+		t.Fatalf("routing_reason = %#v", got)
 	}
 }
 

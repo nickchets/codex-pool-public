@@ -565,7 +565,7 @@ func TestBuildPoolDashboardDataCountsAntigravityGeminiImports(t *testing.T) {
 	if len(data.Accounts) != 1 {
 		t.Fatalf("accounts=%d", len(data.Accounts))
 	}
-	if data.Accounts[0].OperatorSource != "antigravity browser auth" {
+	if data.Accounts[0].OperatorSource != "Gemini Browser Auth" {
 		t.Fatalf("operator_source=%q", data.Accounts[0].OperatorSource)
 	}
 	if data.Accounts[0].Email != "ag@example.com" {
@@ -777,6 +777,61 @@ func TestBuildPoolDashboardDataMarksAllowlistedValidationBlockedGeminiQuotaModel
 	}
 }
 
+func TestBuildPoolDashboardDataMarksWarmedMissingProjectGeminiSeatDegradedEnabled(t *testing.T) {
+	now := time.Date(2026, 3, 27, 12, 0, 0, 0, time.UTC)
+	seat := &Account{
+		ID:                        "gemini_missing_project_warmed",
+		Type:                      AccountTypeGemini,
+		PlanType:                  "gemini",
+		AuthMode:                  accountAuthModeOAuth,
+		OperatorSource:            geminiOperatorSourceAntigravityImport,
+		OAuthProfileID:            geminiOAuthAntigravityProfileID,
+		GeminiProviderCheckedAt:   now,
+		GeminiOperationalState:    geminiOperationalTruthStateDegradedOK,
+		GeminiOperationalReason:   "operator smoke succeeded via fallback project",
+		GeminiQuotaUpdatedAt:      now,
+		GeminiQuotaModels:         []GeminiModelQuotaSnapshot{{Name: "gemini-3.1-pro-high", RouteProvider: "gemini", Percentage: 81}},
+		GeminiProviderTruthReason: "provider truth missing project_id",
+	}
+
+	h := &proxyHandler{
+		pool:      newPoolState([]*Account{seat}, false),
+		startTime: now.Add(-time.Hour),
+	}
+
+	data := h.buildPoolDashboardData(now)
+	if len(data.Accounts) != 1 {
+		t.Fatalf("accounts=%d", len(data.Accounts))
+	}
+	if !data.Accounts[0].Routing.Eligible {
+		t.Fatalf("routing=%+v", data.Accounts[0].Routing)
+	}
+	if data.Accounts[0].Routing.State != routingDisplayStateDegradedEnabled {
+		t.Fatalf("routing_state=%q", data.Accounts[0].Routing.State)
+	}
+	if data.Accounts[0].Routing.BlockReason != "" {
+		t.Fatalf("block_reason=%q", data.Accounts[0].Routing.BlockReason)
+	}
+	if !strings.Contains(data.Accounts[0].Routing.DegradedReason, "fallback project") {
+		t.Fatalf("degraded_reason=%q", data.Accounts[0].Routing.DegradedReason)
+	}
+	if data.Accounts[0].ProviderTruth == nil {
+		t.Fatal("expected provider_truth object")
+	}
+	if data.Accounts[0].ProviderTruth.State != geminiProviderTruthStateMissingProjectID {
+		t.Fatalf("provider_truth.state=%q", data.Accounts[0].ProviderTruth.State)
+	}
+	if data.Accounts[0].ProviderTruth == nil || data.Accounts[0].ProviderTruth.Quota == nil || len(data.Accounts[0].ProviderTruth.Quota.Models) != 1 {
+		t.Fatalf("provider_truth=%#v", data.Accounts[0].ProviderTruth)
+	}
+	if !data.Accounts[0].ProviderTruth.Quota.Models[0].Routable {
+		t.Fatalf("quota_model=%#v", data.Accounts[0].ProviderTruth.Quota.Models[0])
+	}
+	if data.Accounts[0].ProviderTruth.Quota.Models[0].CompatibilityReason != "" {
+		t.Fatalf("compatibility_reason=%q", data.Accounts[0].ProviderTruth.Quota.Models[0].CompatibilityReason)
+	}
+}
+
 func TestBuildPoolDashboardDataSummarizesGeminiQuotaSnapshotWithoutModelRows(t *testing.T) {
 	now := time.Date(2026, 3, 27, 12, 0, 0, 0, time.UTC)
 	seat := &Account{
@@ -951,6 +1006,47 @@ func TestBuildPoolDashboardDataCountsEligibleGeminiCooldownSeats(t *testing.T) {
 	}
 	if data.Accounts[0].Routing.State != routingDisplayStateDegradedEnabled {
 		t.Fatalf("routing.state=%q", data.Accounts[0].Routing.State)
+	}
+	if data.Accounts[0].HealthStatus != geminiOperationalTruthStateCooldown {
+		t.Fatalf("health_status=%q", data.Accounts[0].HealthStatus)
+	}
+}
+
+func TestBuildPoolDashboardDataCompactsGeminiCooldownDegradedReason(t *testing.T) {
+	now := time.Date(2026, 3, 28, 11, 40, 0, 0, time.UTC)
+	resetAt := now.Add(4 * time.Minute)
+	seat := &Account{
+		ID:                      "gemini_ready_cooldown_compact",
+		Type:                    AccountTypeGemini,
+		PlanType:                "gemini",
+		AuthMode:                accountAuthModeOAuth,
+		OperatorSource:          geminiOperatorSourceAntigravityImport,
+		AntigravityProjectID:    "project-1",
+		GeminiProviderCheckedAt: now.Add(-5 * time.Minute),
+		GeminiOperationalState:  geminiOperationalTruthStateCooldown,
+		GeminiOperationalReason: "gemini code assist request failed: 429 Too Many Requests: {\"error\":{\"status\":\"RESOURCE_EXHAUSTED\",\"details\":[{\"metadata\":{\"quotaResetTimeStamp\":\"2026-03-28T11:44:00Z\"}}]}}",
+		GeminiModelRateLimitResetTimes: map[string]time.Time{
+			"gemini-3.1-pro-high": resetAt,
+		},
+	}
+
+	h := &proxyHandler{
+		pool:      newPoolState([]*Account{seat}, false),
+		startTime: now.Add(-time.Hour),
+	}
+
+	data := h.buildPoolDashboardData(now)
+	if data.Accounts[0].Routing.State != routingDisplayStateDegradedEnabled {
+		t.Fatalf("routing=%+v", data.Accounts[0].Routing)
+	}
+	if !strings.Contains(data.Accounts[0].Routing.DegradedReason, "gemini-3.1-pro-high") {
+		t.Fatalf("degraded_reason=%q", data.Accounts[0].Routing.DegradedReason)
+	}
+	if !strings.Contains(data.Accounts[0].Routing.DegradedReason, resetAt.Format(time.RFC3339)) {
+		t.Fatalf("degraded_reason=%q", data.Accounts[0].Routing.DegradedReason)
+	}
+	if strings.Contains(data.Accounts[0].Routing.DegradedReason, "RESOURCE_EXHAUSTED") {
+		t.Fatalf("degraded_reason=%q", data.Accounts[0].Routing.DegradedReason)
 	}
 }
 
@@ -1243,8 +1339,8 @@ func TestServeStatusPageClarifiesQuotaVsLocalFields(t *testing.T) {
 	}
 	body := rr.Body.String()
 	for _, fragment := range []string{
-		"Current Active Seat",
-		"No live request is active right now.",
+		"Diagnostics Surface",
+		"Return to Dashboard",
 		"Remaining (5h)",
 		"Remaining (7d)",
 		"healthy seats routable",
@@ -1274,6 +1370,242 @@ func TestServeStatusPageClarifiesQuotaVsLocalFields(t *testing.T) {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("unexpected fragment %q in body", forbidden)
 		}
+	}
+}
+
+func TestServeStatusPageShowsCodexRefreshInvalidHealthLine(t *testing.T) {
+	now := time.Now().UTC()
+	account := &Account{
+		ID:              "refresh-invalid",
+		Type:            AccountTypeCodex,
+		PlanType:        "team",
+		AccountID:       "workspace-a",
+		IDToken:         testCodexIDToken(t, "user-a", "workspace-a", "a@example.com", "sub-a", now.Add(4*time.Hour)),
+		HealthStatus:    codexRefreshInvalidHealthStatus,
+		HealthError:     codexRefreshInvalidHealthError,
+		HealthCheckedAt: now.Add(-2 * time.Minute),
+		LastHealthyAt:   now.Add(-5 * time.Minute),
+		Usage: UsageSnapshot{
+			PrimaryUsedPercent:   0.15,
+			SecondaryUsedPercent: 0.20,
+			PrimaryResetAt:       now.Add(90 * time.Minute),
+			SecondaryResetAt:     now.Add(24 * time.Hour),
+			RetrievedAt:          now.Add(-time.Minute),
+			Source:               "wham",
+		},
+	}
+	h := &proxyHandler{
+		pool:      newPoolState([]*Account{account}, false),
+		startTime: now.Add(-time.Hour),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/status", nil)
+	rr := httptest.NewRecorder()
+	h.serveStatusPage(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "health refresh_invalid") {
+		t.Fatalf("missing refresh_invalid health line in body: %s", body)
+	}
+	if !strings.Contains(body, codexRefreshInvalidHealthError) {
+		t.Fatalf("missing refresh_invalid detail in body: %s", body)
+	}
+}
+
+func TestServeStatusPageIncludesGeminiQuotaModelRows(t *testing.T) {
+	now := time.Date(2026, 3, 27, 18, 0, 0, 0, time.UTC)
+	readyAccount := &Account{
+		ID:                         "gemini_html_quota",
+		Type:                       AccountTypeGemini,
+		PlanType:                   "gemini",
+		AuthMode:                   accountAuthModeOAuth,
+		OperatorSource:             geminiOperatorSourceAntigravityImport,
+		AntigravityProjectID:       "project-1",
+		GeminiProviderTruthReady:   true,
+		GeminiProviderTruthState:   geminiProviderTruthStateReady,
+		GeminiOperationalState:     geminiOperationalTruthStateCleanOK,
+		GeminiOperationalReason:    "healthy proof",
+		GeminiProviderCheckedAt:    now.Add(-2 * time.Minute),
+		GeminiQuotaUpdatedAt:       now.Add(-time.Minute),
+		GeminiProtectedModels:      []string{"gemini-3.1-pro-high"},
+		GeminiModelForwardingRules: map[string]string{"gemini-1.5-pro": "gemini-2.5-pro"},
+		GeminiQuotaModels: []GeminiModelQuotaSnapshot{{
+			Name:             "gemini-3.1-pro-high",
+			DisplayName:      "Gemini 3.1 Pro High",
+			RouteProvider:    "gemini",
+			Percentage:       84,
+			ResetTime:        "2026-03-28T02:00:00Z",
+			SupportsImages:   true,
+			SupportsThinking: true,
+			ThinkingBudget:   8192,
+			MaxTokens:        1048576,
+			MaxOutputTokens:  65535,
+			Recommended:      true,
+		}, {
+			Name:          "claude-sonnet-4-6",
+			DisplayName:   "Claude Sonnet 4.6",
+			RouteProvider: "claude",
+			Percentage:    62,
+			ResetTime:     "2026-03-28T03:00:00Z",
+		}},
+	}
+	blockedAccount := &Account{
+		ID:                           "gemini_html_quota_blocked",
+		Type:                         AccountTypeGemini,
+		PlanType:                     "gemini",
+		AuthMode:                     accountAuthModeOAuth,
+		OperatorSource:               geminiOperatorSourceAntigravityImport,
+		OAuthProfileID:               geminiOAuthAntigravityProfileID,
+		AntigravityProjectID:         "project-2",
+		AntigravityValidationBlocked: true,
+		GeminiValidationReasonCode:   "ACCOUNT_NEEDS_WORKSPACE",
+		GeminiProviderTruthState:     geminiProviderTruthStateValidationBlocked,
+		GeminiProviderTruthReason:    "workspace validation required",
+		GeminiOperationalState:       geminiOperationalTruthStateDegradedOK,
+		GeminiOperationalReason:      "workspace validation required",
+		GeminiProviderCheckedAt:      now.Add(-90 * time.Second),
+		GeminiQuotaUpdatedAt:         now.Add(-45 * time.Second),
+		GeminiQuotaModels: []GeminiModelQuotaSnapshot{{
+			Name:          "gemini-2.5-flash",
+			DisplayName:   "Gemini 2.5 Flash",
+			RouteProvider: "gemini",
+			Percentage:    73,
+			ResetTime:     "2026-03-28T02:30:00Z",
+		}},
+	}
+	h := &proxyHandler{
+		pool:      newPoolState([]*Account{readyAccount, blockedAccount}, false),
+		startTime: now.Add(-time.Hour),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/status", nil)
+	rr := httptest.NewRecorder()
+	h.serveStatusPage(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	for _, fragment := range []string{
+		"Gemini 3.1 Pro High",
+		"Claude Sonnet 4.6",
+		"quota-model-list",
+		"tag-state-routable",
+		"tag-state-seat-blocked",
+		"tag-state-catalog",
+		"protected",
+		"recommended",
+		"Gemini 2.5 Flash",
+		"workspace validation required",
+		"quota catalog only; Anthropic-compatible adapter is not implemented",
+		"max 1048576",
+		"max out 65535",
+		"thinking 8192",
+		"images",
+		"thinking",
+		"reset 2026-03-28T02:00:00Z",
+		"reset 2026-03-28T02:30:00Z",
+		"reset 2026-03-28T03:00:00Z",
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("missing fragment %q in body", fragment)
+		}
+	}
+}
+
+func TestServeStatusPageIncludesLiveGeminiModelCooldownRows(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	resetAt := now.Add(4 * time.Minute).Truncate(time.Second)
+	account := &Account{
+		ID:                       "gemini_live_model_cooldown",
+		Type:                     AccountTypeGemini,
+		PlanType:                 "gemini",
+		AuthMode:                 accountAuthModeOAuth,
+		OperatorSource:           geminiOperatorSourceAntigravityImport,
+		AntigravityProjectID:     "project-live",
+		GeminiProviderTruthReady: true,
+		GeminiProviderTruthState: geminiProviderTruthStateReady,
+		GeminiOperationalState:   geminiOperationalTruthStateCooldown,
+		GeminiProviderCheckedAt:  now,
+		GeminiModelRateLimitResetTimes: map[string]time.Time{
+			"gemini-3.1-pro-high": resetAt,
+		},
+	}
+	h := &proxyHandler{
+		pool:      newPoolState([]*Account{account}, false),
+		startTime: now.Add(-time.Hour),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/status?format=json", nil)
+	rr := httptest.NewRecorder()
+	h.serveStatusPage(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var payload StatusData
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode json: %v", err)
+	}
+	if len(payload.Accounts) != 1 || payload.Accounts[0].ProviderTruth == nil || payload.Accounts[0].ProviderTruth.Quota == nil {
+		t.Fatalf("payload = %#v", payload.Accounts)
+	}
+	models := payload.Accounts[0].ProviderTruth.Quota.Models
+	if len(models) != 1 {
+		t.Fatalf("models = %#v", models)
+	}
+	if models[0].Name != "gemini-3.1-pro-high" || models[0].Percentage != 100 || models[0].ResetTime != resetAt.Format(time.RFC3339) {
+		t.Fatalf("model = %#v", models[0])
+	}
+	if payload.Accounts[0].ProviderTruth.RateLimitResetTimes["gemini-3.1-pro-high"] != resetAt.Format(time.RFC3339) {
+		t.Fatalf("provider_truth.rate_limit_reset_times = %#v", payload.Accounts[0].ProviderTruth.RateLimitResetTimes)
+	}
+	if payload.Accounts[0].HealthStatus != geminiOperationalTruthStateCooldown {
+		t.Fatalf("health_status=%q", payload.Accounts[0].HealthStatus)
+	}
+}
+
+func TestBuildPoolDashboardDataCooldownOverridesPersistedGeminiRestrictedHealthStatus(t *testing.T) {
+	now := time.Date(2026, 3, 24, 10, 40, 0, 0, time.UTC)
+	seat := &Account{
+		ID:                           "gemini_restricted_cooldown_health",
+		Type:                         AccountTypeGemini,
+		PlanType:                     "gemini",
+		AuthMode:                     accountAuthModeOAuth,
+		OperatorSource:               geminiOperatorSourceAntigravityImport,
+		OAuthProfileID:               geminiOAuthAntigravityProfileID,
+		AntigravityValidationBlocked: true,
+		GeminiValidationReasonCode:   "UNSUPPORTED_LOCATION",
+		GeminiProviderTruthState:     geminiProviderTruthStateRestricted,
+		GeminiProviderTruthReason:    "UNSUPPORTED_LOCATION",
+		HealthStatus:                 "restricted",
+		GeminiOperationalState:       geminiOperationalTruthStateCooldown,
+		GeminiOperationalReason:      "quota resets in 4s",
+	}
+
+	h := &proxyHandler{
+		pool:      newPoolState([]*Account{seat}, false),
+		startTime: now.Add(-time.Hour),
+	}
+
+	data := h.buildPoolDashboardData(now)
+	if len(data.Accounts) != 1 {
+		t.Fatalf("accounts=%d", len(data.Accounts))
+	}
+	if data.Accounts[0].Routing.State != routingDisplayStateDegradedEnabled {
+		t.Fatalf("routing=%+v", data.Accounts[0].Routing)
+	}
+	if data.Accounts[0].ProviderTruth == nil || data.Accounts[0].ProviderTruth.State != geminiProviderTruthStateRestricted {
+		t.Fatalf("provider_truth=%+v", data.Accounts[0].ProviderTruth)
+	}
+	if data.Accounts[0].OperationalTruth == nil || data.Accounts[0].OperationalTruth.State != geminiOperationalTruthStateCooldown {
+		t.Fatalf("operational_truth=%+v", data.Accounts[0].OperationalTruth)
+	}
+	if data.Accounts[0].HealthStatus != geminiOperationalTruthStateCooldown {
+		t.Fatalf("health_status=%q", data.Accounts[0].HealthStatus)
 	}
 }
 
@@ -1981,7 +2313,7 @@ func TestLocalOperatorGeminiAntigravityOAuthStartAllowsLoopbackWithoutAdminHeade
 		cfg: config{adminToken: "secret"},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/operator/gemini/antigravity/oauth-start", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/operator/gemini/oauth-start", strings.NewReader(`{}`))
 	req.Host = "127.0.0.1:8989"
 	req.RemoteAddr = "127.0.0.1:4242"
 	req.Header.Set("Content-Type", "application/json")
@@ -2336,7 +2668,7 @@ func TestLocalOperatorGeminiAntigravityOAuthCallbackStoresImportedSeat(t *testin
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "Antigravity Gemini seat added") {
+	if !strings.Contains(rr.Body.String(), "Gemini seat added") {
 		t.Fatalf("unexpected body=%s", rr.Body.String())
 	}
 	if h.pool.count() != 1 {
@@ -2559,7 +2891,7 @@ func TestLocalOperatorGeminiAntigravityOAuthCallbackStoresValidationBlockedSeat(
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "Antigravity Gemini seat saved with provider block") {
+	if !strings.Contains(rr.Body.String(), "Gemini seat saved with provider block") {
 		t.Fatalf("unexpected body=%s", rr.Body.String())
 	}
 	if h.pool.count() != 1 {
@@ -2711,7 +3043,7 @@ func TestLocalOperatorGeminiAntigravityOAuthCallbackStoresMissingProjectSeat(t *
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "Antigravity Gemini seat saved with provider block") {
+	if !strings.Contains(rr.Body.String(), "Gemini seat saved with provider block") {
 		t.Fatalf("unexpected body=%s", rr.Body.String())
 	}
 	if h.pool.count() != 1 {
@@ -3359,7 +3691,7 @@ func TestServeStatusPageIncludesQuarantineStatus(t *testing.T) {
 	}
 }
 
-func TestServeStatusPageIncludesOperatorActionForLocalLoopback(t *testing.T) {
+func TestServeStatusPageUsesDiagnosticsSurfaceForLocalLoopback(t *testing.T) {
 	setGeminiOAuthTestProfiles(t)
 
 	now := time.Date(2026, 3, 19, 13, 0, 0, 0, time.UTC)
@@ -3391,14 +3723,28 @@ func TestServeStatusPageIncludesOperatorActionForLocalLoopback(t *testing.T) {
 	}
 	body := rr.Body.String()
 	for _, fragment := range []string{
+		"Pool Diagnostics",
+		"Diagnostics Surface",
+		"read-only and diagnostic-heavy",
+		"Return to Dashboard",
+		"Status JSON",
+		"Health check",
+		"🪑 Seats",
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("missing fragment %q in body", fragment)
+		}
+	}
+	for _, forbidden := range []string{
+		"Import oauth_creds.json",
 		"Start Codex OAuth",
 		"Fallback API Pool",
-		"Antigravity Gemini Auth",
-		"Start Antigravity Gemini Auth",
+		"Gemini Browser Auth",
+		"Start Gemini Browser Auth",
 		"Add API Key",
 		"openai-api-key-input",
 		"/operator/codex/api-key-add",
-		"/operator/gemini/antigravity/oauth-start",
+		"/operator/gemini/oauth-start",
 		"/operator/account-delete",
 		"deleteAccountFromStatus",
 		"account-action-status",
@@ -3410,21 +3756,10 @@ func TestServeStatusPageIncludesOperatorActionForLocalLoopback(t *testing.T) {
 		"refreshes this page automatically when pool seat state changes",
 		"Waiting for pool seat state to change...",
 		"Waiting for pool seat state to change.",
-		"Waiting for the Antigravity Gemini seat state to change...",
-		"Timed out waiting for the Antigravity Gemini seat state to change.",
+		"Waiting for the Gemini Browser Auth seat state to change...",
+		"Timed out waiting for the Gemini Browser Auth seat state to change.",
 		"codex-oauth-result",
 		"gemini_oauth_result",
-		"auth_expires_at",
-		"last_refresh_at",
-	} {
-		if !strings.Contains(body, fragment) {
-			t.Fatalf("missing fragment %q in body", fragment)
-		}
-	}
-	for _, forbidden := range []string{
-		"Manual Gemini Import",
-		"Import oauth_creds.json",
-		"gemini-seat-json-input",
 		"/operator/gemini/import-oauth-creds",
 		"noopener noreferrer",
 		"auth_expires_in || ''",
@@ -3466,16 +3801,25 @@ func TestServeStatusPageHidesOperatorActionOutsideLoopback(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
+	for _, fragment := range []string{
+		"Pool Diagnostics",
+		"Diagnostics Surface",
+		"Return to Dashboard",
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("missing fragment %q in body", fragment)
+		}
+	}
 	for _, forbidden := range []string{
 		"Import Gemini",
 		"Start Codex OAuth",
 		"POST /operator/codex/oauth-start",
 		"/operator/codex/oauth-start",
 		"Fallback API Pool",
-		"Antigravity Gemini Auth",
-		"Start Antigravity Gemini Auth",
+		"Gemini Browser Auth",
+		"Start Gemini Browser Auth",
 		"/operator/codex/api-key-add",
-		"/operator/gemini/antigravity/oauth-start",
+		"/operator/gemini/oauth-start",
 		"/operator/account-delete",
 	} {
 		if strings.Contains(body, forbidden) {

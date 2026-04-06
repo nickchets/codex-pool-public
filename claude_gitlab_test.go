@@ -250,6 +250,27 @@ func TestClassifyManagedGitLabClaudeDirectAccessForbiddenMarksDead(t *testing.T)
 	}
 }
 
+func TestClassifyManagedGitLabClaudeErrorOrgTPMUsesSharedShortCooldown(t *testing.T) {
+	disposition := classifyManagedGitLabClaudeError(
+		managedGitLabClaudeErrorSourceGatewayRequest,
+		http.StatusTooManyRequests,
+		http.Header{},
+		[]byte(`{"error":{"message":"This request would exceed your organization's rate limit of 18,000,000 input tokens per minute"}}`),
+	)
+	if !disposition.RateLimit {
+		t.Fatalf("expected rate limit classification, got %+v", disposition)
+	}
+	if disposition.MarkDead {
+		t.Fatalf("did not expect dead classification, got %+v", disposition)
+	}
+	if !disposition.SharedOrgTPM {
+		t.Fatalf("expected shared org TPM classification, got %+v", disposition)
+	}
+	if disposition.Cooldown != managedGitLabClaudeOrgTPMRateLimitWait {
+		t.Fatalf("cooldown=%v", disposition.Cooldown)
+	}
+}
+
 func TestGitLabClaudeQuotaExceededCooldownExpandsExponentially(t *testing.T) {
 	if got := gitLabClaudeQuotaExceededCooldown(1); got != 30*time.Minute {
 		t.Fatalf("count1=%v", got)
@@ -262,6 +283,110 @@ func TestGitLabClaudeQuotaExceededCooldownExpandsExponentially(t *testing.T) {
 	}
 	if got := gitLabClaudeQuotaExceededCooldown(10); got != 24*time.Hour {
 		t.Fatalf("count10=%v", got)
+	}
+}
+
+func TestApplyManagedGitLabClaudeDispositionParsesRetryAfterHTTPDate(t *testing.T) {
+	acc := &Account{
+		ID:           "claude_gitlab_retry_after",
+		Type:         AccountTypeClaude,
+		AuthMode:     accountAuthModeGitLab,
+		AccessToken:  "gateway-token",
+		ExtraHeaders: map[string]string{"X-Test": "retry-after"},
+	}
+	now := time.Now().UTC()
+	headers := http.Header{
+		"Retry-After": []string{now.Add(90 * time.Second).Format(http.TimeFormat)},
+	}
+	disposition := managedGitLabClaudeErrorDisposition{
+		RateLimit:    true,
+		HealthStatus: "rate_limited",
+		Cooldown:     managedGitLabClaudeRateLimitWait,
+		Reason:       "rate limit",
+	}
+
+	applyManagedGitLabClaudeDisposition(acc, disposition, headers, now)
+
+	if acc.RateLimitUntil.IsZero() {
+		t.Fatal("expected rate limit until")
+	}
+	wait := acc.RateLimitUntil.Sub(now)
+	if wait < 89*time.Second || wait > 91*time.Second {
+		t.Fatalf("rate_limit_until=%v wait=%v", acc.RateLimitUntil, wait)
+	}
+}
+
+func TestApplyManagedGitLabClaudeDispositionOrgTPMUsesShortFallbackWithoutRetryAfter(t *testing.T) {
+	acc := &Account{
+		ID:           "claude_gitlab_org_tpm",
+		Type:         AccountTypeClaude,
+		AuthMode:     accountAuthModeGitLab,
+		AccessToken:  "gateway-token",
+		ExtraHeaders: map[string]string{"X-Test": "org-tpm"},
+	}
+	now := time.Now().UTC()
+	disposition := managedGitLabClaudeErrorDisposition{
+		RateLimit:    true,
+		SharedOrgTPM: true,
+		HealthStatus: "rate_limited",
+		Cooldown:     managedGitLabClaudeOrgTPMRateLimitWait,
+		Reason:       "This request would exceed your organization's rate limit of 18,000,000 input tokens per minute",
+	}
+
+	applyManagedGitLabClaudeDisposition(acc, disposition, http.Header{}, now)
+
+	if acc.RateLimitUntil.IsZero() {
+		t.Fatal("expected rate limit until")
+	}
+	wait := acc.RateLimitUntil.Sub(now)
+	if wait < 74*time.Second || wait > 76*time.Second {
+		t.Fatalf("rate_limit_until=%v wait=%v", acc.RateLimitUntil, wait)
+	}
+}
+
+func TestGitLabClaudeScopeKeyPrefersEntitlementHeadersOverInstanceOnly(t *testing.T) {
+	base := &Account{
+		Type:            AccountTypeClaude,
+		AuthMode:        accountAuthModeGitLab,
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders: map[string]string{
+			"X-Gitlab-Instance-Id":                  "inst-1",
+			"X-Gitlab-Feature-Enabled-By-Namespace-Ids": "100,200",
+			"X-Gitlab-User-Id":                      "42",
+		},
+	}
+	sameEntitlement := &Account{
+		Type:            AccountTypeClaude,
+		AuthMode:        accountAuthModeGitLab,
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders: map[string]string{
+			"X-Gitlab-Instance-Id":                  "inst-1",
+			"X-Gitlab-Feature-Enabled-By-Namespace-Ids": "100,200",
+			"X-Gitlab-User-Id":                      "77",
+		},
+	}
+	differentEntitlement := &Account{
+		Type:            AccountTypeClaude,
+		AuthMode:        accountAuthModeGitLab,
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders: map[string]string{
+			"X-Gitlab-Instance-Id":                  "inst-1",
+			"X-Gitlab-Feature-Enabled-By-Namespace-Ids": "300",
+			"X-Gitlab-User-Id":                      "42",
+		},
+	}
+
+	if got := gitLabClaudeScopeKey(base); got == "" {
+		t.Fatal("expected non-empty scope key")
+	}
+	if got, want := gitLabClaudeScopeKey(sameEntitlement), gitLabClaudeScopeKey(base); got != want {
+		t.Fatalf("same entitlement scope mismatch: got %q want %q", got, want)
+	}
+	if got, want := gitLabClaudeScopeKey(differentEntitlement), gitLabClaudeScopeKey(base); got == want {
+		t.Fatalf("expected different entitlement scope, got %q", got)
 	}
 }
 
