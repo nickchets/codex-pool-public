@@ -383,6 +383,13 @@ type Account struct {
 	GitLabRateLimitResetAt    time.Time
 	GitLabQuotaExceededCount  int
 	GitLabLastQuotaExceededAt time.Time
+	GitLabCanaryModel         string
+	GitLabCanaryNextProbeAt   time.Time
+	GitLabCanaryLastAttemptAt time.Time
+	GitLabCanaryLastSuccessAt time.Time
+	GitLabCanaryLastFailureAt time.Time
+	GitLabCanaryLastResult    string
+	GitLabCanaryLastError     string
 
 	// Aggregated token counters (in-memory for now; persist later)
 	Totals AccountUsage
@@ -1435,6 +1442,7 @@ type poolState struct {
 	mu             sync.RWMutex
 	accounts       []*Account
 	convPin        map[string]string // conversation_id -> account ID
+	pendingClaims  map[string]int64
 	activeCodexID  string
 	activeAPIID    string
 	activeGeminiID string
@@ -1453,7 +1461,13 @@ type accountRuntimeState struct {
 }
 
 func newPoolState(accs []*Account, debug bool) *poolState {
-	return &poolState{accounts: accs, convPin: map[string]string{}, debug: debug, tierThreshold: 0.15}
+	return &poolState{
+		accounts:      accs,
+		convPin:       map[string]string{},
+		pendingClaims: map[string]int64{},
+		debug:         debug,
+		tierThreshold: 0.15,
+	}
 }
 
 // replace swaps the pool accounts (used on reload).
@@ -1462,6 +1476,7 @@ func (p *poolState) replace(accs []*Account) {
 	defer p.mu.Unlock()
 	p.accounts = accs
 	p.convPin = map[string]string{}
+	p.pendingClaims = map[string]int64{}
 	p.rr = 0
 }
 
@@ -1558,6 +1573,34 @@ func (p *poolState) candidate(conversationID string, exclude map[string]bool, ac
 	return p.candidateAtLocked(time.Now(), conversationID, exclude, accountType, requiredPlan, true)
 }
 
+func (p *poolState) claimCandidate(conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string) *Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	acc := p.candidateAtLocked(time.Now(), conversationID, exclude, accountType, requiredPlan, true)
+	if acc == nil {
+		return nil
+	}
+	p.pendingClaims[acc.ID]++
+	return acc
+}
+
+func (p *poolState) releaseClaim(accountID string) {
+	if p == nil || strings.TrimSpace(accountID) == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	current := p.pendingClaims[accountID]
+	switch {
+	case current <= 1:
+		delete(p.pendingClaims, accountID)
+	default:
+		p.pendingClaims[accountID] = current - 1
+	}
+}
+
 func (p *poolState) peekCandidate(accountType AccountType, requiredPlan string) *Account {
 	return p.peekCandidateAt(time.Now(), accountType, requiredPlan)
 }
@@ -1583,6 +1626,13 @@ func (p *poolState) candidateAtLocked(now time.Time, conversationID string, excl
 		p.rememberSelectedSeatLocked(accountType, selected)
 	}
 	return selected
+}
+
+func (p *poolState) effectiveInflightLocked(a *Account) int64 {
+	if a == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&a.Inflight) + p.pendingClaims[a.ID]
 }
 
 func (p *poolState) pinnedEligibleCandidateLocked(now time.Time, conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string) *Account {
@@ -1634,13 +1684,18 @@ func (p *poolState) pinnedEligibleCandidateLocked(now time.Time, conversationID 
 
 func (p *poolState) stickyEligibleCandidateLocked(now time.Time, exclude map[string]bool, accountType AccountType, requiredPlan string) *Account {
 	if accountType == AccountTypeCodex {
-		if acc := p.activeCodexCandidateLocked(now, exclude, requiredPlan, false); acc != nil {
-			return acc
-		}
-		if acc := p.stickyEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, func(a *Account) bool {
+		localCodex := func(a *Account) bool {
 			return codexAccountMatchesSelectionMode(a, requiredPlan, false)
-		}); acc != nil {
-			return acc
+		}
+		if acc := p.activeCodexCandidateLocked(now, exclude, requiredPlan, false); acc != nil {
+			if !p.codexStickySeatNeedsRotationLocked(now, acc, exclude, requiredPlan, localCodex) {
+				return acc
+			}
+		}
+		if acc := p.stickyEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, localCodex); acc != nil {
+			if !p.codexStickySeatNeedsRotationLocked(now, acc, exclude, requiredPlan, localCodex) {
+				return acc
+			}
 		}
 		if codexRequiresGitLabPlan(requiredPlan) {
 			return nil
@@ -1660,6 +1715,39 @@ func (p *poolState) stickyEligibleCandidateLocked(now time.Time, exclude map[str
 		})
 	}
 	return p.stickyEligibleCandidateMatchingLocked(now, exclude, accountType, requiredPlan, nil)
+}
+
+func (p *poolState) codexStickySeatNeedsRotationLocked(now time.Time, current *Account, exclude map[string]bool, requiredPlan string, include func(*Account) bool) bool {
+	if current == nil {
+		return false
+	}
+	currentInflight := p.effectiveInflightLocked(current)
+	if currentInflight <= 0 {
+		return false
+	}
+	for _, candidate := range p.accounts {
+		if candidate == nil || candidate.ID == current.ID {
+			continue
+		}
+		if include != nil && !include(candidate) {
+			continue
+		}
+		if exclude != nil && exclude[candidate.ID] {
+			continue
+		}
+
+		candidate.mu.Lock()
+		routing := routingStateLocked(candidate, now, AccountTypeCodex, requiredPlan)
+		eligible := routing.Eligible && !authExpiryBlocksStickySelectionLocked(candidate, now)
+		candidate.mu.Unlock()
+		if !eligible {
+			continue
+		}
+		if p.effectiveInflightLocked(candidate) < currentInflight {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *poolState) rememberSelectedSeatLocked(accountType AccountType, acc *Account) {
@@ -1834,6 +1922,11 @@ func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude
 				return candidate.lastUsed.Before(incumbent.lastUsed)
 			}
 		}
+		if accountType == AccountTypeCodex &&
+			(candidate.inflight > 0 || incumbent.inflight > 0) &&
+			candidate.inflight != incumbent.inflight {
+			return candidate.inflight < incumbent.inflight
+		}
 		if candidate.score != incumbent.score {
 			return candidate.score > incumbent.score
 		}
@@ -1878,7 +1971,7 @@ func (p *poolState) selectEligibleCandidateMatchingLocked(now time.Time, exclude
 		gitLabClaude := isGitLabClaudeAccount(a)
 		score := scoreAccountLocked(a, now)
 		a.mu.Unlock()
-		inflight := atomic.LoadInt64(&a.Inflight)
+		inflight := p.effectiveInflightLocked(a)
 		score -= float64(inflight) * 0.02
 		eligible = append(eligible, scoredAccount{
 			acc:          a,
@@ -2250,6 +2343,7 @@ func saveCodexAccount(a *Account) error {
 	setJSONField(root, "health_error", strings.TrimSpace(a.HealthError), strings.TrimSpace(a.HealthError) != "")
 	setJSONTimeField(root, "health_checked_at", a.HealthCheckedAt)
 	setJSONTimeField(root, "last_healthy_at", a.LastHealthyAt)
+	setJSONTimeField(root, "rate_limit_until", a.RateLimitUntil)
 
 	// Persist dead flag so accounts stay dead across restarts
 	if a.Dead {

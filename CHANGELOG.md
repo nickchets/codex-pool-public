@@ -9,11 +9,19 @@ It does not preserve upstream git ancestry. The documented imported Go-core base
 The format is loosely based on Keep a Changelog. Versioning rules are defined in
 [`VERSIONING.md`](./VERSIONING.md).
 
-## [0.10.1] - 2026-03-30
+## [0.10.3] - 2026-04-06
+
+### Added
+- GitLab Claude shared-TPM recovery now keeps a per-scope canary schedule and surfaces the last canary result directly in dashboard and account-status output.
+- Runtime metrics now track named retry and recovery events plus provider TTFB buckets so operator troubleshooting can separate prestream retry churn from downstream latency.
 
 ### Changed
-- The published repository tree is now steriler: repo-local governance, handoff, audit, and closure-spec documents are no longer shipped in `main`.
-- Public bundle export rules now match the published tree and keep the documented `orchestrator/codex_pool_manager.py` helper available instead of treating it as private packaging residue.
+- Fresh Codex seat selection now reserves the chosen seat before caller work starts and prefers lower-inflight seats for new work, reducing duplicate concurrent picks on the same seat.
+- GitLab Claude dashboard health rendering now clears stale shared-cooldown noise once a seat becomes eligible again while preserving visible recovery-canary state.
+
+### Fixed
+- Local Codex streamed usage-limit failures now become persisted cooldown state instead of leaving the seat falsely healthy after the SSE failure event.
+- Managed OpenAI API usage-limit error text is now classified as a retryable rate-limit condition instead of collapsing into a dead-key style quota failure.
 
 ## [0.10.2] - 2026-03-30
 
@@ -23,6 +31,12 @@ The format is loosely based on Keep a Changelog. Versioning rules are defined in
 
 ### Verified
 - Live per-seat probes now separate one genuinely dead `claude_gitlab` seat (`402 insufficient_credits`) from the remaining healthy seats instead of flattening the whole provider lane into `rate_limited`.
+
+## [0.10.1] - 2026-03-30
+
+### Changed
+- The published repository tree is now steriler: repo-local governance, handoff, audit, and closure-spec documents are no longer shipped in `main`.
+- Public bundle export rules now match the published tree and keep the documented `orchestrator/codex_pool_manager.py` helper available instead of treating it as private packaging residue.
 
 ## [0.10.0] - 2026-03-30
 

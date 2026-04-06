@@ -367,6 +367,44 @@ func TestBuildPoolDashboardDataShowsGitLabDirectAccessSignals(t *testing.T) {
 	}
 }
 
+func TestBuildPoolDashboardDataDerivesHealthyGitLabClaudeStatusAfterCooldownExpiry(t *testing.T) {
+	now := time.Date(2026, 3, 30, 17, 0, 0, 0, time.UTC)
+	gitlabClaude := &Account{
+		ID:              "claude_gitlab_recovered",
+		Type:            AccountTypeClaude,
+		PlanType:        "gitlab_duo",
+		AuthMode:        accountAuthModeGitLab,
+		AccessToken:     "gateway-live",
+		RefreshToken:    "glpat-live",
+		SourceBaseURL:   defaultGitLabInstanceURL,
+		UpstreamBaseURL: defaultGitLabClaudeGatewayURL,
+		ExtraHeaders:    map[string]string{"X-Gitlab-Instance-Id": "inst-1"},
+		HealthStatus:    "rate_limited",
+		HealthError:     managedGitLabClaudeSharedOrgTPMHealthError("This request would exceed your organization's rate limit of 18,000,000 input tokens per minute"),
+		RateLimitUntil:  now.Add(-2 * time.Minute),
+	}
+
+	h := &proxyHandler{
+		pool:      newPoolState([]*Account{gitlabClaude}, false),
+		startTime: now.Add(-time.Hour),
+	}
+
+	data := h.buildPoolDashboardData(now)
+	if len(data.Accounts) != 1 {
+		t.Fatalf("accounts=%d", len(data.Accounts))
+	}
+	status := data.Accounts[0]
+	if status.HealthStatus != "healthy" {
+		t.Fatalf("health_status=%q", status.HealthStatus)
+	}
+	if status.HealthError != "" {
+		t.Fatalf("health_error=%q", status.HealthError)
+	}
+	if !status.Routing.Eligible {
+		t.Fatalf("routing=%+v", status.Routing)
+	}
+}
+
 func TestBuildPoolDashboardDataSeparatesGeminiOperatorLanes(t *testing.T) {
 	setGeminiOAuthTestProfiles(t)
 
