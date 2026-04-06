@@ -8,6 +8,20 @@ Go-ядра: `darvell/codex-pool@4570f6b`.
 
 Правила версионирования описаны в [`VERSIONING.ru.md`](./VERSIONING.ru.md).
 
+## [0.10.4] - 2026-04-06
+
+### Изменено
+- Public bundle export теперь использует детерминированный tar-based copy path вместо прежнего `rsync`, который на этой машине мог зависать в uninterruptible IO wait во время локальной release-проверки.
+- Сборка dashboard теперь разрезана на меньшие helper-stage для current-seat selection, Gemini/GitLab enrichment, workspace grouping, provider summaries и fallback pool bookkeeping без изменения контракта `/status` JSON/HTML.
+
+### Исправлено
+- Buffered retry handling теперь использует общий helper bookkeeping, уменьшая branch drift в prestream retry-путях.
+- GitLab Claude shared-cooldown reads теперь идут через общий snapshot helper, так что recovery polling, cooldown gating и status path больше не дублируют lock/read/filter logic.
+
+### Внутреннее
+- Kimi и MiniMax теперь делят общий API-key provider base, а повторяющиеся setup/opencode response-body helpers сведены к общим utility.
+- Persisted account health fields теперь записываются через один shared helper вместо повторной сериализации в нескольких save-path.
+
 ## [0.10.3] - 2026-04-06
 
 ### Добавлено
@@ -22,6 +36,12 @@ Go-ядра: `darvell/codex-pool@4570f6b`.
 - Local Codex streamed usage-limit failures теперь переходят в persist'ed cooldown state вместо того, чтобы оставлять seat ложно healthy после SSE failure event.
 - Managed OpenAI API usage-limit text теперь классифицируется как retryable rate-limit, а не схлопывается в dead-key style quota failure.
 
+## [0.10.1] - 2026-03-30
+
+### Изменено
+- Опубликованное дерево репозитория стало стерильнее: repo-local governance, handoff, audit и closure-spec документы больше не поставляются в `main`.
+- Правила экспорта public bundle теперь совпадают с опубликованным деревом и сохраняют документированный helper `orchestrator/codex_pool_manager.py`, а не считают его private packaging residue.
+
 ## [0.10.2] - 2026-03-30
 
 ### Исправлено
@@ -30,12 +50,6 @@ Go-ядра: `darvell/codex-pool@4570f6b`.
 
 ### Проверено
 - Live per-seat probes теперь честно отделяют один реально мертвый `claude_gitlab` seat (`402 insufficient_credits`) от остальных здоровых seat'ов вместо flattening всего provider lane в `rate_limited`.
-
-## [0.10.1] - 2026-03-30
-
-### Изменено
-- Опубликованное дерево репозитория стало стерильнее: repo-local governance, handoff, audit и closure-spec документы больше не поставляются в `main`.
-- Правила экспорта public bundle теперь совпадают с опубликованным деревом и сохраняют документированный helper `orchestrator/codex_pool_manager.py`, а не считают его private packaging residue.
 
 ## [0.10.0] - 2026-03-30
 

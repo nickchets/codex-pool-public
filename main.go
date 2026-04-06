@@ -762,20 +762,6 @@ func removeConflictingProxyHeaders(h http.Header) {
 	h.Del("True-Client-Ip")
 }
 
-func normalizePath(basePath, incoming string) string {
-	if basePath == "" || basePath == "/" {
-		return incoming
-	}
-	if strings.HasPrefix(incoming, basePath) {
-		trimmed := strings.TrimPrefix(incoming, basePath)
-		if !strings.HasPrefix(trimmed, "/") {
-			trimmed = "/" + trimmed
-		}
-		return trimmed
-	}
-	return incoming
-}
-
 func singleJoin(basePath, reqPath string) string {
 	if basePath == "" || basePath == "/" {
 		return reqPath
@@ -1290,6 +1276,12 @@ func (h *proxyHandler) recordTransparentPrestreamRetry(acc *Account) {
 	}
 }
 
+func (h *proxyHandler) finishBufferedRetry(trace *requestTrace, acc *Account, resp *http.Response, attempt, attempts int, refreshFailed bool, retryText string, err error) (bool, error) {
+	h.recordTransparentPrestreamRetry(acc)
+	trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryText), refreshFailed)
+	return true, err
+}
+
 func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *requestTrace, acc *Account, resp *http.Response, refreshFailed bool, requestedModel, requestPath string, attempt, attempts int) (bool, error) {
 	var retryInspection bufferedRetryInspection
 	if needsBufferedRetryInspection(acc, resp.StatusCode) {
@@ -1306,15 +1298,12 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 		if h.cfg.debug {
 			log.Printf("[%s] attempt %d/%d account=%s retryable status=%d refreshFailed=%v", reqID, attempt, attempts, acc.ID, resp.StatusCode, refreshFailed)
 		}
-		trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
-		return true, err
+		return h.finishBufferedRetry(trace, acc, resp, attempt, attempts, refreshFailed, retryInspection.Text, err)
 	}
 
 	if isManagedCodexAPIKeyAccount(acc) && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusPaymentRequired) {
 		err := h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
-		h.recordTransparentPrestreamRetry(acc)
-		trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
-		return true, err
+		return h.finishBufferedRetry(trace, acc, resp, attempt, attempts, refreshFailed, retryInspection.Text, err)
 	}
 
 	// Handle 402 Payment Required - often means deactivated workspace/subscription.
@@ -1323,9 +1312,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 			_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
 			err := formatBufferedRetryStatusError(resp, retryInspection.Text)
 			h.recent.add(err.Error())
-			h.recordTransparentPrestreamRetry(acc)
-			trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
-			return true, err
+			return h.finishBufferedRetry(trace, acc, resp, attempt, attempts, refreshFailed, retryInspection.Text, err)
 		}
 		// Check for deactivated_workspace or similar permanent failures.
 		if strings.Contains(retryInspection.Text, "deactivated_workspace") || strings.Contains(retryInspection.Text, "subscription") {
@@ -1339,9 +1326,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 			}
 			err := fmt.Errorf("account deactivated: %s", retryInspection.Text)
 			h.recent.add(err.Error())
-			h.recordTransparentPrestreamRetry(acc)
-			trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
-			return true, err
+			return h.finishBufferedRetry(trace, acc, resp, attempt, attempts, refreshFailed, retryInspection.Text, err)
 		}
 	}
 
@@ -1351,9 +1336,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 			if h.cfg.debug {
 				log.Printf("[%s] attempt %d/%d account=%s retryable status=%d refreshFailed=%v", reqID, attempt, attempts, acc.ID, resp.StatusCode, refreshFailed)
 			}
-			h.recordTransparentPrestreamRetry(acc)
-			trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
-			return true, err
+			return h.finishBufferedRetry(trace, acc, resp, attempt, attempts, refreshFailed, retryInspection.Text, err)
 		}
 
 		_ = h.applyPreCopyUpstreamStatusDisposition(reqID, acc, resp, refreshFailed, retryInspection.Body, requestedModel, requestPath)
@@ -1377,9 +1360,7 @@ func (h *proxyHandler) applyBufferedRetryDisposition(reqID string, trace *reques
 		if h.cfg.debug {
 			log.Printf("[%s] attempt %d/%d account=%s retryable status=%d refreshFailed=%v", reqID, attempt, attempts, acc.ID, resp.StatusCode, refreshFailed)
 		}
-		h.recordTransparentPrestreamRetry(acc)
-		trace.noteRetryDisposition(acc.Type, acc, attempt, attempts, resp.StatusCode, true, bufferedRetryTraceReason(resp.StatusCode, retryInspection.Text), refreshFailed)
-		return true, err
+		return h.finishBufferedRetry(trace, acc, resp, attempt, attempts, refreshFailed, retryInspection.Text, err)
 	}
 
 	return false, nil
@@ -1458,36 +1439,36 @@ func (h *proxyHandler) runBufferedAttemptContour(
 	return nil, true
 }
 
-func (h *proxyHandler) candidateSupportingPath(conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string, provider Provider, path, requestedModel, forcedGeminiSeatID string) (*Account, error) {
-	if h == nil || h.pool == nil {
-		return nil, nil
+func (h *proxyHandler) forcedGeminiSeatForPath(accountType AccountType, provider Provider, path, forcedGeminiSeatID string) (*Account, error, bool) {
+	if forcedGeminiSeatID == "" {
+		return nil, nil, false
 	}
-	if exclude == nil {
-		exclude = map[string]bool{}
+	acc := h.pool.getByID(forcedGeminiSeatID)
+	if acc == nil {
+		return nil, fmt.Errorf("debug Gemini seat %s not found", forcedGeminiSeatID), true
 	}
-	if forcedGeminiSeatID != "" {
-		acc := h.pool.getByID(forcedGeminiSeatID)
-		if acc == nil {
-			return nil, fmt.Errorf("debug Gemini seat %s not found", forcedGeminiSeatID)
-		}
-		if accountType != AccountTypeGemini || acc.Type != AccountTypeGemini {
-			return nil, fmt.Errorf("debug Gemini seat %s does not match the requested provider", forcedGeminiSeatID)
-		}
-		if !providerSupportsPathForAccount(provider, path, acc) {
-			return nil, fmt.Errorf("debug Gemini seat %s does not support path %s", forcedGeminiSeatID, path)
-		}
-		atomic.AddInt64(&acc.Inflight, 1)
-		return acc, nil
+	if accountType != AccountTypeGemini || acc.Type != AccountTypeGemini {
+		return nil, fmt.Errorf("debug Gemini seat %s does not match the requested provider", forcedGeminiSeatID), true
 	}
+	if !providerSupportsPathForAccount(provider, path, acc) {
+		return nil, fmt.Errorf("debug Gemini seat %s does not support path %s", forcedGeminiSeatID, path), true
+	}
+	atomic.AddInt64(&acc.Inflight, 1)
+	return acc, nil, true
+}
 
+func (h *proxyHandler) candidateSupportingPathAttempts(accountType AccountType) int {
 	attempts := h.pool.count()
 	if accountType != "" {
 		if n := h.pool.countByType(accountType); n > 0 {
 			attempts = n
 		}
 	}
+	return attempts
+}
 
-	now := time.Now().UTC()
+func (h *proxyHandler) claimPathSupportingCandidate(now time.Time, conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string, provider Provider, path, requestedModel string) *Account {
+	attempts := h.candidateSupportingPathAttempts(accountType)
 	for attempt := 0; attempt < attempts; attempt++ {
 		acc := h.pool.claimCandidate(conversationID, exclude, accountType, requiredPlan)
 		if acc == nil {
@@ -1509,6 +1490,24 @@ func (h *proxyHandler) candidateSupportingPath(conversationID string, exclude ma
 		}
 		atomic.AddInt64(&acc.Inflight, 1)
 		h.pool.releaseClaim(acc.ID)
+		return acc
+	}
+	return nil
+}
+
+func (h *proxyHandler) candidateSupportingPath(conversationID string, exclude map[string]bool, accountType AccountType, requiredPlan string, provider Provider, path, requestedModel, forcedGeminiSeatID string) (*Account, error) {
+	if h == nil || h.pool == nil {
+		return nil, nil
+	}
+	if exclude == nil {
+		exclude = map[string]bool{}
+	}
+	if acc, err, handled := h.forcedGeminiSeatForPath(accountType, provider, path, forcedGeminiSeatID); handled {
+		return acc, err
+	}
+
+	now := time.Now().UTC()
+	if acc := h.claimPathSupportingCandidate(now, conversationID, exclude, accountType, requiredPlan, provider, path, requestedModel); acc != nil {
 		return acc, nil
 	}
 
@@ -1612,24 +1611,17 @@ func (h *proxyHandler) gitLabClaudeSharedTPMCooldownError(now time.Time, account
 		if acc == nil || !isGitLabClaudeAccount(acc) || !planMatchesRequired(acc.PlanType, requiredPlan) || !providerSupportsPathForAccount(provider, path, acc) {
 			continue
 		}
-		acc.mu.Lock()
-		disabled := acc.Disabled
-		dead := acc.Dead
-		missingGatewayState := missingGitLabClaudeGatewayState(acc)
-		rateLimitUntil := acc.RateLimitUntil
-		healthStatus := acc.HealthStatus
-		healthError := acc.HealthError
-		acc.mu.Unlock()
-		if disabled || dead || missingGatewayState {
+		snapshot := snapshotGitLabClaudeAccount(acc)
+		if !snapshot.relevantForSharedCooldown() {
 			continue
 		}
 		relevant++
-		if !rateLimitUntil.After(now) || healthStatus != "rate_limited" || !isManagedGitLabClaudeSharedOrgTPMHealthError(healthError) {
+		if !snapshot.sharedTPMBlocked(now) {
 			return nil
 		}
-		if until.IsZero() || rateLimitUntil.Before(until) {
-			until = rateLimitUntil
-			reason = stripManagedGitLabClaudeSharedOrgTPMHealthPrefix(healthError)
+		if until.IsZero() || snapshot.RateLimitUntil.Before(until) {
+			until = snapshot.RateLimitUntil
+			reason = stripManagedGitLabClaudeSharedOrgTPMHealthPrefix(snapshot.HealthError)
 		}
 	}
 	if relevant == 0 || until.IsZero() {
@@ -2576,45 +2568,53 @@ func parseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+func (h *proxyHandler) finalizeClaudePingTailCutoff(reqID string, trace *requestTrace, provider Provider, acc *Account, userID string, statusCode int, isSSE bool, managedStreamFailed bool, initialConversationID string, headerPrimaryPct, headerSecondaryPct float64, respSample []byte, start time.Time, debugLabel string, cutoff *claudePingTailCutoffError) bool {
+	h.finalizeProxyResponse(reqID, provider, acc, userID, statusCode, isSSE, managedStreamFailed, initialConversationID, headerPrimaryPct, headerSecondaryPct, respSample)
+	if h.metrics != nil {
+		h.metrics.inc(strconv.Itoa(statusCode), acc.ID)
+	}
+	if trace != nil {
+		trace.noteFinish(statusCode, isSSE, managedStreamFailed, nil)
+	}
+	log.Printf(
+		"[%s] claude gitlab ping-only tail cut off early (account=%s stalled_ms=%d timeout_ms=%d last_non_ping_type=%q)",
+		reqID,
+		acc.ID,
+		cutoff.stalledFor.Milliseconds(),
+		cutoff.timeout.Milliseconds(),
+		cutoff.lastNonPingType,
+	)
+	if h.cfg.debug {
+		log.Printf("[%s] %s status=%d account=%s duration_ms=%d", reqID, debugLabel, statusCode, acc.ID, time.Since(start).Milliseconds())
+	}
+	return true
+}
+
+func (h *proxyHandler) finalizeCopiedProxyCopyError(reqID string, trace *requestTrace, acc *Account, statusCode int, isSSE bool, managedStreamFailed bool, copyErr error, logStreamError bool) bool {
+	if h.recent != nil {
+		h.recent.add(copyErr.Error())
+	}
+	if h.metrics != nil {
+		h.metrics.inc("error", acc.ID)
+	}
+	if logStreamError {
+		log.Printf("[%s] SSE stream error (account=%s): %v", reqID, acc.ID, copyErr)
+	}
+	if trace != nil {
+		trace.noteFinish(statusCode, isSSE, managedStreamFailed, copyErr)
+	}
+	return false
+}
+
 func (h *proxyHandler) finalizeCopiedProxyResponse(reqID string, trace *requestTrace, provider Provider, acc *Account, userID string, statusCode int, isSSE bool, managedStreamFailed bool, initialConversationID string, headerPrimaryPct, headerSecondaryPct float64, respSample []byte, copyErr error, logStreamError bool, start time.Time, debugLabel string) bool {
 	if acc == nil {
 		return false
 	}
 	if copyErr != nil {
 		if cutoff, ok := matchClaudePingTailCutoff(copyErr, acc); ok {
-			h.finalizeProxyResponse(reqID, provider, acc, userID, statusCode, isSSE, managedStreamFailed, initialConversationID, headerPrimaryPct, headerSecondaryPct, respSample)
-			if h.metrics != nil {
-				h.metrics.inc(strconv.Itoa(statusCode), acc.ID)
-			}
-			if trace != nil {
-				trace.noteFinish(statusCode, isSSE, managedStreamFailed, nil)
-			}
-			log.Printf(
-				"[%s] claude gitlab ping-only tail cut off early (account=%s stalled_ms=%d timeout_ms=%d last_non_ping_type=%q)",
-				reqID,
-				acc.ID,
-				cutoff.stalledFor.Milliseconds(),
-				cutoff.timeout.Milliseconds(),
-				cutoff.lastNonPingType,
-			)
-			if h.cfg.debug {
-				log.Printf("[%s] %s status=%d account=%s duration_ms=%d", reqID, debugLabel, statusCode, acc.ID, time.Since(start).Milliseconds())
-			}
-			return true
+			return h.finalizeClaudePingTailCutoff(reqID, trace, provider, acc, userID, statusCode, isSSE, managedStreamFailed, initialConversationID, headerPrimaryPct, headerSecondaryPct, respSample, start, debugLabel, cutoff)
 		}
-		if h.recent != nil {
-			h.recent.add(copyErr.Error())
-		}
-		if h.metrics != nil {
-			h.metrics.inc("error", acc.ID)
-		}
-		if logStreamError {
-			log.Printf("[%s] SSE stream error (account=%s): %v", reqID, acc.ID, copyErr)
-		}
-		if trace != nil {
-			trace.noteFinish(statusCode, isSSE, managedStreamFailed, copyErr)
-		}
-		return false
+		return h.finalizeCopiedProxyCopyError(reqID, trace, acc, statusCode, isSSE, managedStreamFailed, copyErr, logStreamError)
 	}
 
 	h.finalizeProxyResponse(reqID, provider, acc, userID, statusCode, isSSE, managedStreamFailed, initialConversationID, headerPrimaryPct, headerSecondaryPct, respSample)

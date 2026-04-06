@@ -855,6 +855,397 @@ func firstSeatStatus(values ...*CurrentSeatStatus) *CurrentSeatStatus {
 	return nil
 }
 
+type currentSeatDashboardState struct {
+	ActiveSeat         *CurrentSeatStatus
+	LastUsedSeat       *CurrentSeatStatus
+	BestEligibleSeat   *CurrentSeatStatus
+	CurrentSeat        *CurrentSeatStatus
+	NextOpenAIAPIKeyID string
+	NextGitLabTokenID  string
+}
+
+func buildCurrentSeatDashboardState(pool *poolState, now time.Time, candidateByID map[string]currentSeatCandidate, activeSeat, lastUsedSeat, nextOpenAIAPIKey, nextGitLabClaudeToken *currentSeatCandidate, activeSeatCount int) currentSeatDashboardState {
+	state := currentSeatDashboardState{
+		ActiveSeat:   currentSeatStatusFromCandidate(activeSeat, "Live requests are currently using this seat.", activeSeatCount),
+		LastUsedSeat: currentSeatStatusFromCandidate(lastUsedSeat, "This is the most recently used local seat.", activeSeatCount),
+	}
+	if sameSeatStatus(state.ActiveSeat, state.LastUsedSeat) {
+		state.LastUsedSeat = nil
+	}
+
+	var nextAccount *Account
+	if pool != nil {
+		nextAccount = pool.peekCandidateAt(now, AccountTypeCodex, "")
+		if nextAccount == nil {
+			nextAccount = pool.peekCandidateAt(now, "", "")
+		}
+	}
+	if nextAccount != nil {
+		if nextCandidate, ok := candidateByID[nextAccount.ID]; ok {
+			nextBasis := "If a new unpinned request starts now, the pool will choose this seat."
+			if state.ActiveSeat != nil && sameSeatStatus(state.ActiveSeat, currentSeatStatusFromCandidate(&nextCandidate, nextBasis, activeSeatCount)) {
+				nextBasis = "New unpinned requests would also land on this seat right now."
+			}
+			state.BestEligibleSeat = currentSeatStatusFromCandidate(&nextCandidate, nextBasis, activeSeatCount)
+		}
+	}
+	if sameSeatStatus(state.ActiveSeat, state.BestEligibleSeat) || sameSeatStatus(state.LastUsedSeat, state.BestEligibleSeat) {
+		state.BestEligibleSeat = nil
+	}
+	state.CurrentSeat = firstSeatStatus(state.ActiveSeat, state.BestEligibleSeat, state.LastUsedSeat)
+	if nextOpenAIAPIKey != nil {
+		state.NextOpenAIAPIKeyID = nextOpenAIAPIKey.status.ID
+	}
+	if nextGitLabClaudeToken != nil {
+		state.NextGitLabTokenID = nextGitLabClaudeToken.status.ID
+	}
+	return state
+}
+
+func recordProviderSummary(providerSummary map[string]PoolDashboardProviderSum, providerKey string, eligible bool) {
+	if providerSummary == nil || providerKey == "" {
+		return
+	}
+	prov := providerSummary[providerKey]
+	prov.TotalAccounts++
+	if eligible {
+		prov.EligibleAccounts++
+	}
+	providerSummary[providerKey] = prov
+}
+
+func recordWorkspaceGroupSeat(workspaceGroups map[string]*poolWorkspaceAccumulator, now time.Time, status AccountStatus, routing routingState) {
+	if workspaceGroups == nil || status.FallbackOnly {
+		return
+	}
+	groupKey := workspaceKeyFor(status.Type, status.WorkspaceID)
+	group := workspaceGroups[groupKey]
+	if group == nil {
+		group = &poolWorkspaceAccumulator{
+			WorkspaceID: status.WorkspaceID,
+			Provider:    status.Type,
+			SeatKeys:    make(map[string]struct{}),
+			AccountIDs:  make(map[string]struct{}),
+			Emails:      make(map[string]struct{}),
+		}
+		workspaceGroups[groupKey] = group
+	}
+	group.SeatCount++
+	group.SeatKeys[status.SeatKey] = struct{}{}
+	group.AccountIDs[status.ID] = struct{}{}
+	if status.Email != "" {
+		group.Emails[status.Email] = struct{}{}
+	}
+	if routing.Eligible {
+		group.EligibleCount++
+		return
+	}
+	group.BlockedCount++
+	if routing.RecoveryAt.After(now) && (group.NextRecoveryAt.IsZero() || routing.RecoveryAt.Before(group.NextRecoveryAt)) {
+		group.NextRecoveryAt = routing.RecoveryAt
+	}
+}
+
+func accumulateSpecialPoolStatus(data *StatusData, snapshot accountSnapshot, routing routingState, status AccountStatus, candidate currentSeatCandidate, nextOpenAIAPIKey, nextGitLabClaudeToken **currentSeatCandidate) {
+	if data == nil {
+		return
+	}
+	if status.FallbackOnly {
+		if status.Dead {
+			data.OpenAIAPIPool.DeadKeys++
+		}
+		if status.HealthStatus == "healthy" && !status.Dead && !status.Disabled {
+			data.OpenAIAPIPool.HealthyKeys++
+		}
+		if routing.Eligible {
+			data.OpenAIAPIPool.EligibleKeys++
+			if status.ProbeState != "healthy" {
+				data.OpenAIAPIPool.EligibleUnhealthyKeys++
+			}
+			if *nextOpenAIAPIKey == nil || prefersBestEligibleSeat(candidate, *nextOpenAIAPIKey) {
+				candidateCopy := candidate
+				*nextOpenAIAPIKey = &candidateCopy
+			}
+		}
+	}
+	if snapshot.GitLabClaude {
+		data.GitLabClaudePool.TotalTokens++
+		if status.Dead {
+			data.GitLabClaudePool.DeadTokens++
+		}
+		if status.HealthStatus == "healthy" && !status.Dead && !status.Disabled {
+			data.GitLabClaudePool.HealthyTokens++
+		}
+		if routing.Eligible {
+			data.GitLabClaudePool.EligibleTokens++
+			if *nextGitLabClaudeToken == nil || prefersBestEligibleSeat(candidate, *nextGitLabClaudeToken) {
+				candidateCopy := candidate
+				*nextGitLabClaudeToken = &candidateCopy
+			}
+		}
+	}
+}
+
+func recordGeminiOperatorCounts(status *GeminiOperatorStatus, snapshot accountSnapshot, operatorSource string) {
+	if status == nil || snapshot.Type != AccountTypeGemini {
+		return
+	}
+	switch operatorSource {
+	case geminiOperatorSourceManagedOAuth:
+		status.ManagedSeatCount++
+	case geminiOperatorSourceAntigravityImport:
+		status.ImportedSeatCount++
+		status.AntigravitySeatCount++
+	case geminiOperatorSourceManualImport, geminiOperatorSourceManualImportLegacy:
+		status.ImportedSeatCount++
+		status.LegacySeatCount++
+	}
+}
+
+func enrichCommonDashboardStatus(status *AccountStatus, snapshot accountSnapshot, routing routingState, claims codexJWTClaims, now time.Time) {
+	if status == nil {
+		return
+	}
+	if !snapshot.Usage.PrimaryResetAt.IsZero() && snapshot.Usage.PrimaryResetAt.After(now) {
+		status.PrimaryResetIn = formatDuration(snapshot.Usage.PrimaryResetAt.Sub(now))
+	} else if snapshot.Usage.PrimaryWindowMinutes > 0 {
+		status.PrimaryResetIn = fmt.Sprintf("~%dm", snapshot.Usage.PrimaryWindowMinutes)
+	}
+	if !snapshot.Usage.SecondaryResetAt.IsZero() && snapshot.Usage.SecondaryResetAt.After(now) {
+		status.SecondaryResetIn = formatDuration(snapshot.Usage.SecondaryResetAt.Sub(now))
+	} else if snapshot.Usage.SecondaryWindowMinutes > 0 {
+		status.SecondaryResetIn = fmt.Sprintf("~%dd", snapshot.Usage.SecondaryWindowMinutes/60/24)
+	}
+	if !snapshot.LastRefresh.IsZero() {
+		status.LastRefreshAt = snapshot.LastRefresh.UTC().Format(time.RFC3339)
+	}
+	if !snapshot.HealthCheckedAt.IsZero() {
+		status.HealthCheckedAt = snapshot.HealthCheckedAt.UTC().Format(time.RFC3339)
+	}
+	if !snapshot.LastHealthyAt.IsZero() {
+		status.LastHealthyAt = snapshot.LastHealthyAt.UTC().Format(time.RFC3339)
+	}
+	if !snapshot.DeadSince.IsZero() {
+		status.DeadSince = snapshot.DeadSince.UTC().Format(time.RFC3339)
+	}
+	status.HealthStatus = displayAccountHealthStatus(snapshot, routing)
+	status.HealthError = displayAccountHealthError(snapshot, routing)
+	status.Penalty = snapshot.Penalty
+	if snapshot.FallbackOnly {
+		status.ProbeState = managedOpenAIAPIProbeState(snapshot, now)
+		status.ProbeSummary = managedOpenAIAPIProbeSummary(snapshot, now)
+	}
+	authExpiresAt := snapshot.ExpiresAt
+	if authExpiresAt.IsZero() && !claims.ExpiresAt.IsZero() {
+		authExpiresAt = claims.ExpiresAt
+	}
+	if !authExpiresAt.IsZero() {
+		status.AuthExpiresAt = authExpiresAt.UTC().Format(time.RFC3339)
+		if authExpiresAt.Before(now) {
+			status.AuthExpiresIn = "EXPIRED"
+		} else {
+			status.AuthExpiresIn = formatDuration(authExpiresAt.Sub(now))
+		}
+	}
+	if !snapshot.LastUsed.IsZero() {
+		status.LocalLastUsed = formatDuration(now.Sub(snapshot.LastUsed)) + " ago"
+	} else {
+		status.LocalLastUsed = "never"
+	}
+	if !snapshot.Usage.RetrievedAt.IsZero() {
+		status.UsageObserved = firstNonEmpty(snapshot.Usage.Source, "usage") + " · " + formatDuration(now.Sub(snapshot.Usage.RetrievedAt)) + " ago"
+	} else if strings.TrimSpace(snapshot.Usage.Source) != "" {
+		status.UsageObserved = strings.TrimSpace(snapshot.Usage.Source)
+	}
+}
+
+func enrichGeminiDashboardStatus(status *AccountStatus, snapshot accountSnapshot, routing routingState, now time.Time, geminiPool *GeminiPoolStatus) {
+	if status == nil || geminiPool == nil || snapshot.Type != AccountTypeGemini {
+		return
+	}
+
+	geminiPool.TotalSeats++
+	if routing.Eligible {
+		geminiPool.EligibleSeats++
+		if status.Routing.State == routingDisplayStateDegradedEnabled {
+			geminiPool.DegradedEligibleSeats++
+		} else {
+			geminiPool.CleanEligibleSeats++
+		}
+	}
+	if snapshot.GeminiProviderTruthReady {
+		geminiPool.ReadySeats++
+	}
+	operationalState := strings.TrimSpace(snapshot.GeminiOperationalState)
+	if geminiHasOperationalProof(operationalState) {
+		geminiPool.WarmSeats++
+	}
+	cooldownCounted := false
+	if operationalState == geminiOperationalTruthStateCooldown {
+		geminiPool.CooldownSeats++
+		cooldownCounted = true
+	}
+	if snapshot.AntigravityValidationBlocked {
+		geminiPool.ValidationFlaggedSeats++
+	}
+	switch strings.TrimSpace(snapshot.GeminiProviderTruthState) {
+	case geminiProviderTruthStateRestricted:
+		geminiPool.RestrictedSeats++
+	case geminiProviderTruthStateMissingProjectID:
+		geminiPool.MissingProjectSeats++
+	}
+	switch strings.TrimSpace(routing.BlockReason) {
+	case "rate_limited":
+		if !cooldownCounted {
+			geminiPool.CooldownSeats++
+		}
+	case "not_warmed":
+		geminiPool.NotWarmedSeats++
+	case "stale_provider_truth":
+		geminiPool.StaleTruthSeats++
+	case "stale_quota_snapshot":
+		geminiPool.StaleTruthSeats++
+		geminiPool.StaleQuotaSeats++
+	}
+	status.ProviderSubscriptionTier = strings.TrimSpace(snapshot.GeminiSubscriptionTierID)
+	status.ProviderSubscriptionName = strings.TrimSpace(snapshot.GeminiSubscriptionTierName)
+	status.ProviderValidationCode = strings.TrimSpace(snapshot.GeminiValidationReasonCode)
+	status.ProviderValidationMessage = sanitizeStatusMessage(snapshot.GeminiValidationMessage)
+	status.ProviderValidationURL = strings.TrimSpace(snapshot.GeminiValidationURL)
+	if !snapshot.GeminiProviderCheckedAt.IsZero() {
+		status.ProviderCheckedAt = snapshot.GeminiProviderCheckedAt.UTC().Format(time.RFC3339)
+	}
+
+	protectedModels := normalizeStringSlice(snapshot.GeminiProtectedModels)
+	protectedSet := make(map[string]struct{}, len(protectedModels))
+	for _, modelID := range protectedModels {
+		protectedSet[modelID] = struct{}{}
+	}
+	geminiPool.ProtectedModelCount += len(protectedModels)
+
+	quotaModels := make([]GeminiModelQuotaStatus, 0, len(snapshot.GeminiQuotaModels))
+	for _, model := range snapshot.GeminiQuotaModels {
+		routeProvider := firstNonEmpty(strings.TrimSpace(model.RouteProvider), geminiQuotaModelRouteProvider(model.Name))
+		runtimeSupport := geminiQuotaModelRuntimeSupportForSnapshot(snapshot, routeProvider)
+		quotaModel := GeminiModelQuotaStatus{
+			Name:                strings.TrimSpace(model.Name),
+			RouteProvider:       routeProvider,
+			Routable:            runtimeSupport.Routable,
+			CompatibilityLane:   runtimeSupport.CompatibilityLane,
+			CompatibilityReason: runtimeSupport.CompatibilityReason,
+			Percentage:          model.Percentage,
+			ResetTime:           strings.TrimSpace(model.ResetTime),
+			DisplayName:         strings.TrimSpace(model.DisplayName),
+			SupportsImages:      model.SupportsImages,
+			SupportsThinking:    model.SupportsThinking,
+			ThinkingBudget:      model.ThinkingBudget,
+			Recommended:         model.Recommended,
+			MaxTokens:           model.MaxTokens,
+			MaxOutputTokens:     model.MaxOutputTokens,
+			SupportedMimeTypes:  cloneSupportedMimeTypes(model.SupportedMimeTypes),
+		}
+		_, quotaModel.Protected = protectedSet[quotaModel.Name]
+		quotaModels = append(quotaModels, quotaModel)
+	}
+
+	var quotaStatus *GeminiProviderQuotaStatus
+	if !snapshot.GeminiQuotaUpdatedAt.IsZero() || len(snapshot.GeminiModelForwardingRules) > 0 || len(quotaModels) > 0 {
+		quotaStatus = &GeminiProviderQuotaStatus{
+			ModelForwardingRules: cloneStringMap(snapshot.GeminiModelForwardingRules),
+			Models:               quotaModels,
+		}
+		if !snapshot.GeminiQuotaUpdatedAt.IsZero() {
+			quotaStatus.UpdatedAt = snapshot.GeminiQuotaUpdatedAt.UTC().Format(time.RFC3339)
+		}
+	}
+	if quotaStatus != nil {
+		geminiPool.QuotaTrackedSeats++
+		geminiPool.QuotaModelCount += len(quotaModels)
+		if len(quotaModels) == 0 {
+			geminiPool.QuotaEmptySeats++
+		}
+	}
+
+	providerTruth := &GeminiProviderTruthStatus{
+		Ready:                snapshot.GeminiProviderTruthReady,
+		State:                strings.TrimSpace(snapshot.GeminiProviderTruthState),
+		Reason:               sanitizeStatusMessage(snapshot.GeminiProviderTruthReason),
+		ProjectID:            strings.TrimSpace(snapshot.AntigravityProjectID),
+		SubscriptionTierID:   strings.TrimSpace(snapshot.GeminiSubscriptionTierID),
+		SubscriptionTierName: strings.TrimSpace(snapshot.GeminiSubscriptionTierName),
+		ValidationReasonCode: strings.TrimSpace(snapshot.GeminiValidationReasonCode),
+		ValidationMessage:    sanitizeStatusMessage(snapshot.GeminiValidationMessage),
+		ValidationURL:        strings.TrimSpace(snapshot.GeminiValidationURL),
+		ProxyDisabled:        snapshot.AntigravityProxyDisabled,
+		Restricted:           strings.TrimSpace(snapshot.GeminiProviderTruthState) == geminiProviderTruthStateRestricted,
+		ValidationBlocked:    snapshot.AntigravityValidationBlocked,
+		QuotaForbidden:       snapshot.AntigravityQuotaForbidden,
+		QuotaForbiddenReason: sanitizeStatusMessage(snapshot.AntigravityQuotaForbiddenReason),
+		ProtectedModels:      protectedModels,
+		RateLimitResetTimes:  formatGeminiModelRateLimitResetTimes(snapshot.GeminiModelRateLimitResetTimes, now),
+		Quota:                quotaStatus,
+	}
+	if !snapshot.GeminiProviderCheckedAt.IsZero() {
+		providerTruth.CheckedAt = snapshot.GeminiProviderCheckedAt.UTC().Format(time.RFC3339)
+	}
+	freshness := geminiProviderTruthFreshnessStatus(
+		snapshot.GeminiProviderTruthState,
+		snapshot.GeminiProviderCheckedAt,
+		snapshot.GeminiQuotaUpdatedAt,
+		now,
+	)
+	if freshness.State != "" {
+		providerTruth.FreshnessState = freshness.State
+		providerTruth.Stale = freshness.Stale
+		providerTruth.StaleReason = sanitizeStatusMessage(freshness.Reason)
+		if !freshness.FreshUntil.IsZero() {
+			providerTruth.FreshUntil = freshness.FreshUntil.UTC().Format(time.RFC3339)
+		}
+	}
+	status.ProviderTruth = providerTruth
+	status.OperationalTruth = geminiOperationalTruthStatus(snapshot)
+	status.ProviderQuotaSummary = summarizeGeminiQuotaStatus(snapshot.GeminiQuotaUpdatedAt, quotaModels)
+}
+
+func enrichGitLabClaudeDashboardStatus(status *AccountStatus, snapshot accountSnapshot, now time.Time) {
+	if status == nil || !snapshot.GitLabClaude {
+		return
+	}
+	status.GitLabRateLimitName = strings.TrimSpace(snapshot.GitLabRateLimitName)
+	status.GitLabRateLimitLimit = snapshot.GitLabRateLimitLimit
+	status.GitLabRateLimitRemaining = snapshot.GitLabRateLimitRemaining
+	status.GitLabQuotaExceededCount = snapshot.GitLabQuotaExceededCount
+	if !snapshot.GitLabRateLimitResetAt.IsZero() {
+		status.GitLabRateLimitResetAt = snapshot.GitLabRateLimitResetAt.UTC().Format(time.RFC3339)
+		if snapshot.GitLabRateLimitResetAt.After(now) {
+			status.GitLabRateLimitResetIn = formatDuration(snapshot.GitLabRateLimitResetAt.Sub(now))
+		}
+	}
+	if snapshot.GitLabQuotaExceededCount > 0 && !snapshot.RateLimitUntil.IsZero() && snapshot.RateLimitUntil.After(now) {
+		status.GitLabQuotaProbeIn = formatDuration(snapshot.RateLimitUntil.Sub(now))
+	}
+	status.GitLabCanaryModel = strings.TrimSpace(snapshot.GitLabCanaryModel)
+	if !snapshot.GitLabCanaryNextProbeAt.IsZero() {
+		status.GitLabCanaryProbeAt = snapshot.GitLabCanaryNextProbeAt.UTC().Format(time.RFC3339)
+		if snapshot.GitLabCanaryNextProbeAt.After(now) {
+			status.GitLabCanaryProbeIn = formatDuration(snapshot.GitLabCanaryNextProbeAt.Sub(now))
+		} else {
+			status.GitLabCanaryProbeIn = "due now"
+		}
+	}
+	if !snapshot.GitLabCanaryLastAttemptAt.IsZero() {
+		status.GitLabCanaryLastAttemptAt = snapshot.GitLabCanaryLastAttemptAt.UTC().Format(time.RFC3339)
+	}
+	if !snapshot.GitLabCanaryLastSuccessAt.IsZero() {
+		status.GitLabCanaryLastSuccessAt = snapshot.GitLabCanaryLastSuccessAt.UTC().Format(time.RFC3339)
+	}
+	status.GitLabCanaryLastResult = strings.TrimSpace(snapshot.GitLabCanaryLastResult)
+	status.GitLabCanaryLastError = sanitizeStatusMessage(snapshot.GitLabCanaryLastError)
+	if status.UsageObserved == "" {
+		status.UsageObserved = "local totals only · GitLab quota hidden"
+	}
+}
+
 func buildPoolDashboardRouting(snapshot accountSnapshot, routing routingState, now time.Time) PoolDashboardRouting {
 	state, degradedReason := geminiRoutingDisplay(snapshot, routing, now)
 	row := PoolDashboardRouting{
@@ -1009,280 +1400,15 @@ func (h *proxyHandler) buildPoolDashboardData(now time.Time) StatusData {
 		if routingRow.RecoveryAt != "" {
 			status.RecoveryAt = routingRow.RecoveryAt
 		}
-		if !snapshot.Usage.PrimaryResetAt.IsZero() && snapshot.Usage.PrimaryResetAt.After(now) {
-			status.PrimaryResetIn = formatDuration(snapshot.Usage.PrimaryResetAt.Sub(now))
-		} else if snapshot.Usage.PrimaryWindowMinutes > 0 {
-			status.PrimaryResetIn = fmt.Sprintf("~%dm", snapshot.Usage.PrimaryWindowMinutes)
-		}
-		if !snapshot.Usage.SecondaryResetAt.IsZero() && snapshot.Usage.SecondaryResetAt.After(now) {
-			status.SecondaryResetIn = formatDuration(snapshot.Usage.SecondaryResetAt.Sub(now))
-		} else if snapshot.Usage.SecondaryWindowMinutes > 0 {
-			status.SecondaryResetIn = fmt.Sprintf("~%dd", snapshot.Usage.SecondaryWindowMinutes/60/24)
-		}
-		if !snapshot.LastRefresh.IsZero() {
-			status.LastRefreshAt = snapshot.LastRefresh.UTC().Format(time.RFC3339)
-		}
-		if !snapshot.HealthCheckedAt.IsZero() {
-			status.HealthCheckedAt = snapshot.HealthCheckedAt.UTC().Format(time.RFC3339)
-		}
-		if !snapshot.LastHealthyAt.IsZero() {
-			status.LastHealthyAt = snapshot.LastHealthyAt.UTC().Format(time.RFC3339)
-		}
-		if snapshot.Type == AccountTypeGemini {
-			geminiPool.TotalSeats++
-			if routing.Eligible {
-				geminiPool.EligibleSeats++
-				if status.Routing.State == routingDisplayStateDegradedEnabled {
-					geminiPool.DegradedEligibleSeats++
-				} else {
-					geminiPool.CleanEligibleSeats++
-				}
-			}
-			if snapshot.GeminiProviderTruthReady {
-				geminiPool.ReadySeats++
-			}
-			operationalState := strings.TrimSpace(snapshot.GeminiOperationalState)
-			if geminiHasOperationalProof(operationalState) {
-				geminiPool.WarmSeats++
-			}
-			cooldownCounted := false
-			if operationalState == geminiOperationalTruthStateCooldown {
-				geminiPool.CooldownSeats++
-				cooldownCounted = true
-			}
-			if snapshot.AntigravityValidationBlocked {
-				geminiPool.ValidationFlaggedSeats++
-			}
-			switch strings.TrimSpace(snapshot.GeminiProviderTruthState) {
-			case geminiProviderTruthStateRestricted:
-				geminiPool.RestrictedSeats++
-			case geminiProviderTruthStateMissingProjectID:
-				geminiPool.MissingProjectSeats++
-			}
-			switch strings.TrimSpace(routing.BlockReason) {
-			case "rate_limited":
-				if !cooldownCounted {
-					geminiPool.CooldownSeats++
-				}
-			case "not_warmed":
-				geminiPool.NotWarmedSeats++
-			case "stale_provider_truth":
-				geminiPool.StaleTruthSeats++
-			case "stale_quota_snapshot":
-				geminiPool.StaleTruthSeats++
-				geminiPool.StaleQuotaSeats++
-			}
-			status.ProviderSubscriptionTier = strings.TrimSpace(snapshot.GeminiSubscriptionTierID)
-			status.ProviderSubscriptionName = strings.TrimSpace(snapshot.GeminiSubscriptionTierName)
-			status.ProviderValidationCode = strings.TrimSpace(snapshot.GeminiValidationReasonCode)
-			status.ProviderValidationMessage = sanitizeStatusMessage(snapshot.GeminiValidationMessage)
-			status.ProviderValidationURL = strings.TrimSpace(snapshot.GeminiValidationURL)
-			if !snapshot.GeminiProviderCheckedAt.IsZero() {
-				status.ProviderCheckedAt = snapshot.GeminiProviderCheckedAt.UTC().Format(time.RFC3339)
-			}
-			protectedModels := normalizeStringSlice(snapshot.GeminiProtectedModels)
-			protectedSet := make(map[string]struct{}, len(protectedModels))
-			for _, modelID := range protectedModels {
-				protectedSet[modelID] = struct{}{}
-			}
-			geminiPool.ProtectedModelCount += len(protectedModels)
-			quotaModels := make([]GeminiModelQuotaStatus, 0, len(snapshot.GeminiQuotaModels))
-			for _, model := range snapshot.GeminiQuotaModels {
-				routeProvider := firstNonEmpty(strings.TrimSpace(model.RouteProvider), geminiQuotaModelRouteProvider(model.Name))
-				runtimeSupport := geminiQuotaModelRuntimeSupportForSnapshot(snapshot, routeProvider)
-				quotaModel := GeminiModelQuotaStatus{
-					Name:                strings.TrimSpace(model.Name),
-					RouteProvider:       routeProvider,
-					Routable:            runtimeSupport.Routable,
-					CompatibilityLane:   runtimeSupport.CompatibilityLane,
-					CompatibilityReason: runtimeSupport.CompatibilityReason,
-					Percentage:          model.Percentage,
-					ResetTime:           strings.TrimSpace(model.ResetTime),
-					DisplayName:         strings.TrimSpace(model.DisplayName),
-					SupportsImages:      model.SupportsImages,
-					SupportsThinking:    model.SupportsThinking,
-					ThinkingBudget:      model.ThinkingBudget,
-					Recommended:         model.Recommended,
-					MaxTokens:           model.MaxTokens,
-					MaxOutputTokens:     model.MaxOutputTokens,
-					SupportedMimeTypes:  cloneSupportedMimeTypes(model.SupportedMimeTypes),
-				}
-				_, quotaModel.Protected = protectedSet[quotaModel.Name]
-				quotaModels = append(quotaModels, quotaModel)
-			}
-			var quotaStatus *GeminiProviderQuotaStatus
-			if !snapshot.GeminiQuotaUpdatedAt.IsZero() || len(snapshot.GeminiModelForwardingRules) > 0 || len(quotaModels) > 0 {
-				quotaStatus = &GeminiProviderQuotaStatus{
-					ModelForwardingRules: cloneStringMap(snapshot.GeminiModelForwardingRules),
-					Models:               quotaModels,
-				}
-				if !snapshot.GeminiQuotaUpdatedAt.IsZero() {
-					quotaStatus.UpdatedAt = snapshot.GeminiQuotaUpdatedAt.UTC().Format(time.RFC3339)
-				}
-			}
-			if quotaStatus != nil {
-				geminiPool.QuotaTrackedSeats++
-				geminiPool.QuotaModelCount += len(quotaModels)
-				if len(quotaModels) == 0 {
-					geminiPool.QuotaEmptySeats++
-				}
-			}
-			providerTruth := &GeminiProviderTruthStatus{
-				Ready:                snapshot.GeminiProviderTruthReady,
-				State:                strings.TrimSpace(snapshot.GeminiProviderTruthState),
-				Reason:               sanitizeStatusMessage(snapshot.GeminiProviderTruthReason),
-				ProjectID:            strings.TrimSpace(snapshot.AntigravityProjectID),
-				SubscriptionTierID:   strings.TrimSpace(snapshot.GeminiSubscriptionTierID),
-				SubscriptionTierName: strings.TrimSpace(snapshot.GeminiSubscriptionTierName),
-				ValidationReasonCode: strings.TrimSpace(snapshot.GeminiValidationReasonCode),
-				ValidationMessage:    sanitizeStatusMessage(snapshot.GeminiValidationMessage),
-				ValidationURL:        strings.TrimSpace(snapshot.GeminiValidationURL),
-				ProxyDisabled:        snapshot.AntigravityProxyDisabled,
-				Restricted:           strings.TrimSpace(snapshot.GeminiProviderTruthState) == geminiProviderTruthStateRestricted,
-				ValidationBlocked:    snapshot.AntigravityValidationBlocked,
-				QuotaForbidden:       snapshot.AntigravityQuotaForbidden,
-				QuotaForbiddenReason: sanitizeStatusMessage(snapshot.AntigravityQuotaForbiddenReason),
-				ProtectedModels:      protectedModels,
-				RateLimitResetTimes:  formatGeminiModelRateLimitResetTimes(snapshot.GeminiModelRateLimitResetTimes, now),
-				Quota:                quotaStatus,
-			}
-			if !snapshot.GeminiProviderCheckedAt.IsZero() {
-				providerTruth.CheckedAt = snapshot.GeminiProviderCheckedAt.UTC().Format(time.RFC3339)
-			}
-			freshness := geminiProviderTruthFreshnessStatus(
-				snapshot.GeminiProviderTruthState,
-				snapshot.GeminiProviderCheckedAt,
-				snapshot.GeminiQuotaUpdatedAt,
-				now,
-			)
-			if freshness.State != "" {
-				providerTruth.FreshnessState = freshness.State
-				providerTruth.Stale = freshness.Stale
-				providerTruth.StaleReason = sanitizeStatusMessage(freshness.Reason)
-				if !freshness.FreshUntil.IsZero() {
-					providerTruth.FreshUntil = freshness.FreshUntil.UTC().Format(time.RFC3339)
-				}
-			}
-			status.ProviderTruth = providerTruth
-			status.OperationalTruth = geminiOperationalTruthStatus(snapshot)
-			status.ProviderQuotaSummary = summarizeGeminiQuotaStatus(snapshot.GeminiQuotaUpdatedAt, quotaModels)
-		}
-		if !snapshot.DeadSince.IsZero() {
-			status.DeadSince = snapshot.DeadSince.UTC().Format(time.RFC3339)
-		}
-		status.HealthStatus = displayAccountHealthStatus(snapshot, routing)
-		status.HealthError = displayAccountHealthError(snapshot, routing)
-		status.Penalty = snapshot.Penalty
-		if snapshot.FallbackOnly {
-			status.ProbeState = managedOpenAIAPIProbeState(snapshot, now)
-			status.ProbeSummary = managedOpenAIAPIProbeSummary(snapshot, now)
-		}
-		authExpiresAt := snapshot.ExpiresAt
-		if authExpiresAt.IsZero() && !claims.ExpiresAt.IsZero() {
-			authExpiresAt = claims.ExpiresAt
-		}
-		if !authExpiresAt.IsZero() {
-			status.AuthExpiresAt = authExpiresAt.UTC().Format(time.RFC3339)
-			if authExpiresAt.Before(now) {
-				status.AuthExpiresIn = "EXPIRED"
-			} else {
-				status.AuthExpiresIn = formatDuration(authExpiresAt.Sub(now))
-			}
-		}
-		if !snapshot.LastUsed.IsZero() {
-			status.LocalLastUsed = formatDuration(now.Sub(snapshot.LastUsed)) + " ago"
-		} else {
-			status.LocalLastUsed = "never"
-		}
-		if !snapshot.Usage.RetrievedAt.IsZero() {
-			status.UsageObserved = firstNonEmpty(snapshot.Usage.Source, "usage") + " · " + formatDuration(now.Sub(snapshot.Usage.RetrievedAt)) + " ago"
-		} else if strings.TrimSpace(snapshot.Usage.Source) != "" {
-			status.UsageObserved = strings.TrimSpace(snapshot.Usage.Source)
-		}
-		if snapshot.GitLabClaude {
-			status.GitLabRateLimitName = strings.TrimSpace(snapshot.GitLabRateLimitName)
-			status.GitLabRateLimitLimit = snapshot.GitLabRateLimitLimit
-			status.GitLabRateLimitRemaining = snapshot.GitLabRateLimitRemaining
-			status.GitLabQuotaExceededCount = snapshot.GitLabQuotaExceededCount
-			if !snapshot.GitLabRateLimitResetAt.IsZero() {
-				status.GitLabRateLimitResetAt = snapshot.GitLabRateLimitResetAt.UTC().Format(time.RFC3339)
-				if snapshot.GitLabRateLimitResetAt.After(now) {
-					status.GitLabRateLimitResetIn = formatDuration(snapshot.GitLabRateLimitResetAt.Sub(now))
-				}
-			}
-			if snapshot.GitLabQuotaExceededCount > 0 && !snapshot.RateLimitUntil.IsZero() && snapshot.RateLimitUntil.After(now) {
-				status.GitLabQuotaProbeIn = formatDuration(snapshot.RateLimitUntil.Sub(now))
-			}
-			status.GitLabCanaryModel = strings.TrimSpace(snapshot.GitLabCanaryModel)
-			if !snapshot.GitLabCanaryNextProbeAt.IsZero() {
-				status.GitLabCanaryProbeAt = snapshot.GitLabCanaryNextProbeAt.UTC().Format(time.RFC3339)
-				if snapshot.GitLabCanaryNextProbeAt.After(now) {
-					status.GitLabCanaryProbeIn = formatDuration(snapshot.GitLabCanaryNextProbeAt.Sub(now))
-				} else {
-					status.GitLabCanaryProbeIn = "due now"
-				}
-			}
-			if !snapshot.GitLabCanaryLastAttemptAt.IsZero() {
-				status.GitLabCanaryLastAttemptAt = snapshot.GitLabCanaryLastAttemptAt.UTC().Format(time.RFC3339)
-			}
-			if !snapshot.GitLabCanaryLastSuccessAt.IsZero() {
-				status.GitLabCanaryLastSuccessAt = snapshot.GitLabCanaryLastSuccessAt.UTC().Format(time.RFC3339)
-			}
-			status.GitLabCanaryLastResult = strings.TrimSpace(snapshot.GitLabCanaryLastResult)
-			status.GitLabCanaryLastError = sanitizeStatusMessage(snapshot.GitLabCanaryLastError)
-			if status.UsageObserved == "" {
-				status.UsageObserved = "local totals only · GitLab quota hidden"
-			}
-		}
-		if snapshot.Type == AccountTypeGemini {
-			switch operatorSource {
-			case geminiOperatorSourceManagedOAuth:
-				data.GeminiOperator.ManagedSeatCount++
-			case geminiOperatorSourceAntigravityImport:
-				data.GeminiOperator.ImportedSeatCount++
-				data.GeminiOperator.AntigravitySeatCount++
-			case geminiOperatorSourceManualImport, geminiOperatorSourceManualImportLegacy:
-				data.GeminiOperator.ImportedSeatCount++
-				data.GeminiOperator.LegacySeatCount++
-			}
-		}
+		enrichCommonDashboardStatus(&status, snapshot, routing, claims, now)
+		enrichGeminiDashboardStatus(&status, snapshot, routing, now, &geminiPool)
+		enrichGitLabClaudeDashboardStatus(&status, snapshot, now)
+		recordGeminiOperatorCounts(&data.GeminiOperator, snapshot, operatorSource)
 
-		providerKey := status.Type
-		prov := providerSummary[providerKey]
-		prov.TotalAccounts++
-		if routing.Eligible {
-			prov.EligibleAccounts++
-		}
-		providerSummary[providerKey] = prov
-
-		if !status.FallbackOnly {
-			groupKey := workspaceKeyFor(status.Type, workspaceID)
-			group := workspaceGroups[groupKey]
-			if group == nil {
-				group = &poolWorkspaceAccumulator{
-					WorkspaceID: workspaceID,
-					Provider:    status.Type,
-					SeatKeys:    make(map[string]struct{}),
-					AccountIDs:  make(map[string]struct{}),
-					Emails:      make(map[string]struct{}),
-				}
-				workspaceGroups[groupKey] = group
-			}
-			group.SeatCount++
-			group.SeatKeys[seatKey] = struct{}{}
-			group.AccountIDs[status.ID] = struct{}{}
-			if status.Email != "" {
-				group.Emails[status.Email] = struct{}{}
-			}
-			if routing.Eligible {
-				group.EligibleCount++
-			} else {
-				group.BlockedCount++
-				if routing.RecoveryAt.After(now) && (group.NextRecoveryAt.IsZero() || routing.RecoveryAt.Before(group.NextRecoveryAt)) {
-					group.NextRecoveryAt = routing.RecoveryAt
-				}
-			}
-		}
+		recordProviderSummary(providerSummary, status.Type, routing.Eligible)
+		status.WorkspaceID = workspaceID
+		status.SeatKey = seatKey
+		recordWorkspaceGroupSeat(workspaceGroups, now, status, routing)
 
 		if routing.RecoveryAt.After(now) && (earliestRecovery.IsZero() || routing.RecoveryAt.Before(earliestRecovery)) {
 			earliestRecovery = routing.RecoveryAt
@@ -1301,40 +1427,7 @@ func (h *proxyHandler) buildPoolDashboardData(now time.Time) StatusData {
 			candidateCopy := candidate
 			lastUsedSeat = &candidateCopy
 		}
-		if status.FallbackOnly {
-			if status.Dead {
-				data.OpenAIAPIPool.DeadKeys++
-			}
-			if status.HealthStatus == "healthy" && !status.Dead && !status.Disabled {
-				data.OpenAIAPIPool.HealthyKeys++
-			}
-			if routing.Eligible {
-				data.OpenAIAPIPool.EligibleKeys++
-				if status.ProbeState != "healthy" {
-					data.OpenAIAPIPool.EligibleUnhealthyKeys++
-				}
-				if nextOpenAIAPIKey == nil || prefersBestEligibleSeat(candidate, nextOpenAIAPIKey) {
-					candidateCopy := candidate
-					nextOpenAIAPIKey = &candidateCopy
-				}
-			}
-		}
-		if snapshot.GitLabClaude {
-			data.GitLabClaudePool.TotalTokens++
-			if status.Dead {
-				data.GitLabClaudePool.DeadTokens++
-			}
-			if status.HealthStatus == "healthy" && !status.Dead && !status.Disabled {
-				data.GitLabClaudePool.HealthyTokens++
-			}
-			if routing.Eligible {
-				data.GitLabClaudePool.EligibleTokens++
-				if nextGitLabClaudeToken == nil || prefersBestEligibleSeat(candidate, nextGitLabClaudeToken) {
-					candidateCopy := candidate
-					nextGitLabClaudeToken = &candidateCopy
-				}
-			}
-		}
+		accumulateSpecialPoolStatus(&data, snapshot, routing, status, candidate, &nextOpenAIAPIKey, &nextGitLabClaudeToken)
 
 		data.Accounts = append(data.Accounts, status)
 	}
@@ -1356,35 +1449,14 @@ func (h *proxyHandler) buildPoolDashboardData(now time.Time) StatusData {
 	if !earliestRecovery.IsZero() {
 		data.PoolSummary.NextRecoveryAt = earliestRecovery.Format(time.RFC3339)
 	}
-	data.ActiveSeat = currentSeatStatusFromCandidate(activeSeat, "Live requests are currently using this seat.", activeSeatCount)
-	data.LastUsedSeat = currentSeatStatusFromCandidate(lastUsedSeat, "This is the most recently used local seat.", activeSeatCount)
-	if sameSeatStatus(data.ActiveSeat, data.LastUsedSeat) {
-		data.LastUsedSeat = nil
-	}
-	nextAccount := h.pool.peekCandidateAt(now, AccountTypeCodex, "")
-	if nextAccount == nil {
-		nextAccount = h.pool.peekCandidateAt(now, "", "")
-	}
-	if nextAccount != nil {
-		if nextCandidate, ok := candidateByID[nextAccount.ID]; ok {
-			nextBasis := "If a new unpinned request starts now, the pool will choose this seat."
-			if data.ActiveSeat != nil && sameSeatStatus(data.ActiveSeat, currentSeatStatusFromCandidate(&nextCandidate, nextBasis, activeSeatCount)) {
-				nextBasis = "New unpinned requests would also land on this seat right now."
-			}
-			data.BestEligibleSeat = currentSeatStatusFromCandidate(&nextCandidate, nextBasis, activeSeatCount)
-		}
-	}
-	if sameSeatStatus(data.ActiveSeat, data.BestEligibleSeat) || sameSeatStatus(data.LastUsedSeat, data.BestEligibleSeat) {
-		data.BestEligibleSeat = nil
-	}
-	data.CurrentSeat = firstSeatStatus(data.ActiveSeat, data.BestEligibleSeat, data.LastUsedSeat)
-	if nextOpenAIAPIKey != nil {
-		data.OpenAIAPIPool.NextKeyID = nextOpenAIAPIKey.status.ID
-	}
+	seatState := buildCurrentSeatDashboardState(h.pool, now, candidateByID, activeSeat, lastUsedSeat, nextOpenAIAPIKey, nextGitLabClaudeToken, activeSeatCount)
+	data.ActiveSeat = seatState.ActiveSeat
+	data.LastUsedSeat = seatState.LastUsedSeat
+	data.BestEligibleSeat = seatState.BestEligibleSeat
+	data.CurrentSeat = seatState.CurrentSeat
+	data.OpenAIAPIPool.NextKeyID = seatState.NextOpenAIAPIKeyID
 	data.OpenAIAPIPool.StatusNote = managedOpenAIAPIPoolStatusNote(data.OpenAIAPIPool)
-	if nextGitLabClaudeToken != nil {
-		data.GitLabClaudePool.NextTokenID = nextGitLabClaudeToken.status.ID
-	}
+	data.GitLabClaudePool.NextTokenID = seatState.NextGitLabTokenID
 	data.GeminiOperator.Note = geminiOperatorStatusNote(data.GeminiOperator)
 	if geminiPool.TotalSeats > 0 {
 		geminiPool.Note = geminiPoolStatusNote(geminiPool)

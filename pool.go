@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -1390,53 +1389,6 @@ func loadPool(dir string, registry *ProviderRegistry) ([]*Account, error) {
 	return accs, nil
 }
 
-// Note: Individual account loading functions are now in the provider files:
-// - provider_codex.go: CodexProvider.LoadAccount
-// - provider_claude.go: ClaudeProvider.LoadAccount
-// - provider_gemini.go: GeminiProvider.LoadAccount
-
-type jwtClaims struct {
-	ExpiresAt        time.Time
-	ChatGPTAccountID string
-	PlanType         string
-}
-
-func parseClaims(idToken string) jwtClaims {
-	var out jwtClaims
-	parts := strings.Split(idToken, ".")
-	if len(parts) < 2 {
-		return out
-	}
-	payloadB64 := parts[1]
-	payloadBytes, err := base64.RawURLEncoding.DecodeString(payloadB64)
-	if err != nil {
-		return out
-	}
-	var payload map[string]interface{}
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return out
-	}
-	if exp, ok := payload["exp"].(float64); ok {
-		out.ExpiresAt = time.Unix(int64(exp), 0)
-	}
-	// account id may live at top-level or under auth claim
-	if acc, ok := payload["chatgpt_account_id"].(string); ok {
-		out.ChatGPTAccountID = acc
-	}
-	if auth, ok := payload["https://api.openai.com/auth"].(map[string]interface{}); ok {
-		if acc, ok := auth["chatgpt_account_id"].(string); ok && acc != "" {
-			out.ChatGPTAccountID = acc
-		}
-		if plan, ok := auth["chatgpt_plan_type"].(string); ok {
-			out.PlanType = plan
-		}
-	}
-	if out.PlanType == "" {
-		out.PlanType = "pro"
-	}
-	return out
-}
-
 // poolState wraps accounts with a mutex.
 type poolState struct {
 	mu             sync.RWMutex
@@ -2253,6 +2205,19 @@ func saveAccount(a *Account) error {
 	}
 }
 
+func setAccountHealthJSONFields(root map[string]any, a *Account, includeRateLimit bool) {
+	if root == nil || a == nil {
+		return
+	}
+	setJSONField(root, "health_status", strings.TrimSpace(a.HealthStatus), strings.TrimSpace(a.HealthStatus) != "")
+	setJSONField(root, "health_error", strings.TrimSpace(a.HealthError), strings.TrimSpace(a.HealthError) != "")
+	setJSONTimeField(root, "health_checked_at", a.HealthCheckedAt)
+	setJSONTimeField(root, "last_healthy_at", a.LastHealthyAt)
+	if includeRateLimit {
+		setJSONTimeField(root, "rate_limit_until", a.RateLimitUntil)
+	}
+}
+
 func saveCodexAccount(a *Account) error {
 	if isGitLabCodexAccount(a) {
 		return saveGitLabCodexAccount(a)
@@ -2339,11 +2304,7 @@ func saveCodexAccount(a *Account) error {
 		root["last_refresh"] = a.LastRefresh.UTC().Format(time.RFC3339Nano)
 	}
 
-	setJSONField(root, "health_status", strings.TrimSpace(a.HealthStatus), strings.TrimSpace(a.HealthStatus) != "")
-	setJSONField(root, "health_error", strings.TrimSpace(a.HealthError), strings.TrimSpace(a.HealthError) != "")
-	setJSONTimeField(root, "health_checked_at", a.HealthCheckedAt)
-	setJSONTimeField(root, "last_healthy_at", a.LastHealthyAt)
-	setJSONTimeField(root, "rate_limit_until", a.RateLimitUntil)
+	setAccountHealthJSONFields(root, a, true)
 
 	// Persist dead flag so accounts stay dead across restarts
 	if a.Dead {
@@ -2451,11 +2412,7 @@ func saveGeminiAccount(a *Account) error {
 	setJSONField(root, "disabled", true, a.Disabled)
 	setJSONField(root, "dead", true, a.Dead)
 	setJSONTimeField(root, "dead_since", a.DeadSince)
-	setJSONTimeField(root, "rate_limit_until", a.RateLimitUntil)
-	setJSONField(root, "health_status", strings.TrimSpace(a.HealthStatus), strings.TrimSpace(a.HealthStatus) != "")
-	setJSONField(root, "health_error", strings.TrimSpace(a.HealthError), strings.TrimSpace(a.HealthError) != "")
-	setJSONTimeField(root, "health_checked_at", a.HealthCheckedAt)
-	setJSONTimeField(root, "last_healthy_at", a.LastHealthyAt)
+	setAccountHealthJSONFields(root, a, true)
 
 	return atomicWriteJSON(a.File, root)
 }
@@ -2553,71 +2510,6 @@ func (p *poolState) getByID(id string) *Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.getLocked(id)
-}
-
-// averageUsage produces a synthetic usage payload across all alive accounts.
-func (p *poolState) averageUsage() UsageSnapshot {
-	return p.averageUsageByType("")
-}
-
-// averageUsageByType produces a synthetic usage payload for accounts of a specific type.
-// If accountType is empty, averages across all accounts.
-func (p *poolState) averageUsageByType(accountType AccountType) UsageSnapshot {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	var totalP, totalS float64
-	var totalPW, totalSW float64
-	var nP, nS float64
-	var n float64
-	var latestPrimaryReset, latestSecondaryReset time.Time
-	for _, a := range p.accounts {
-		if a.Dead {
-			continue
-		}
-		if accountType != "" && a.Type != accountType {
-			continue
-		}
-		usedP := a.Usage.PrimaryUsedPercent
-		if usedP == 0 {
-			usedP = a.Usage.PrimaryUsed
-		}
-		usedS := a.Usage.SecondaryUsedPercent
-		if usedS == 0 {
-			usedS = a.Usage.SecondaryUsed
-		}
-		totalP += usedP
-		totalS += usedS
-		n += 1
-		if a.Usage.PrimaryWindowMinutes > 0 {
-			totalPW += float64(a.Usage.PrimaryWindowMinutes)
-			nP += 1
-		}
-		if a.Usage.SecondaryWindowMinutes > 0 {
-			totalSW += float64(a.Usage.SecondaryWindowMinutes)
-			nS += 1
-		}
-		// Track latest reset times
-		if !a.Usage.PrimaryResetAt.IsZero() && a.Usage.PrimaryResetAt.After(latestPrimaryReset) {
-			latestPrimaryReset = a.Usage.PrimaryResetAt
-		}
-		if !a.Usage.SecondaryResetAt.IsZero() && a.Usage.SecondaryResetAt.After(latestSecondaryReset) {
-			latestSecondaryReset = a.Usage.SecondaryResetAt
-		}
-	}
-	if n == 0 {
-		return UsageSnapshot{}
-	}
-	return UsageSnapshot{
-		PrimaryUsed:            totalP / n,
-		SecondaryUsed:          totalS / n,
-		PrimaryUsedPercent:     totalP / n,
-		SecondaryUsedPercent:   totalS / n,
-		PrimaryWindowMinutes:   int(totalPW / max(1, nP)),
-		SecondaryWindowMinutes: int(totalSW / max(1, nS)),
-		PrimaryResetAt:         latestPrimaryReset,
-		SecondaryResetAt:       latestSecondaryReset,
-		RetrievedAt:            time.Now(),
-	}
 }
 
 func max(a, b float64) float64 {
@@ -2839,19 +2731,6 @@ func (p *poolState) getPoolUtilization() []PoolUtilization {
 		results = append(results, pu)
 	}
 	return results
-}
-
-func earliestReset(a, b time.Time) time.Time {
-	if a.IsZero() {
-		return b
-	}
-	if b.IsZero() {
-		return a
-	}
-	if a.Before(b) {
-		return a
-	}
-	return b
 }
 
 // UsagePoolStats contains aggregate stats about the pool for the usage endpoint.
@@ -3139,16 +3018,6 @@ func (p *poolState) getPoolStats() UsagePoolStats {
 	return stats
 }
 
-// decayPenalty slowly reduces penalties over time to avoid permanent punishment.
-func decayPenalty(a *Account, now time.Time) {
-	if a == nil {
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	decayPenaltyLocked(a, now)
-}
-
 func decayPenaltyLocked(a *Account, now time.Time) {
 	if a.LastPenalty.IsZero() {
 		a.LastPenalty = now
@@ -3163,11 +3032,4 @@ func decayPenaltyLocked(a *Account, now time.Time) {
 		a.Penalty = 0
 	}
 	a.LastPenalty = now
-}
-
-func (p *poolState) debugf(format string, args ...any) {
-	if p == nil || !p.debug {
-		return
-	}
-	log.Printf(format, args...)
 }

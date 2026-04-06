@@ -225,9 +225,70 @@ func wantsPowerShell(r *http.Request) bool {
 	}
 }
 
-func (h *proxyHandler) serveCodexSetupScript(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.URL.Path, "/setup/codex/")
+func writeSetupScriptResponse(w http.ResponseWriter, contentType string, script string) {
+	w.Header().Set("Content-Type", contentType)
+	_, _ = w.Write([]byte(script))
+}
+
+func setupTokenFromPath(path string, prefix string) string {
+	token := strings.TrimPrefix(path, prefix)
 	if token == "" || strings.Contains(token, "/") {
+		return ""
+	}
+	return token
+}
+
+func bashExtractAccessTokenFunction() string {
+	return `extract_access_token() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    raise SystemExit(0)
+
+token = ""
+if isinstance(data, dict):
+    nested = data.get("tokens")
+    if isinstance(nested, dict):
+        token = str(nested.get("access_token") or "").strip()
+    if not token:
+        token = str(data.get("access_token") or "").strip()
+
+if token:
+    print(token)
+PY
+}`
+}
+
+func (h *proxyHandler) requireSetupPoolUser(w http.ResponseWriter, r *http.Request, prefix string) (string, *PoolUser, bool) {
+	token := setupTokenFromPath(r.URL.Path, prefix)
+	if token == "" {
+		http.Error(w, "invalid token", http.StatusBadRequest)
+		return "", nil, false
+	}
+	if h.poolUsers == nil {
+		http.Error(w, "pool users not configured", http.StatusServiceUnavailable)
+		return "", nil, false
+	}
+	user := h.poolUsers.GetByToken(token)
+	if user == nil {
+		http.Error(w, "invalid token", http.StatusNotFound)
+		return "", nil, false
+	}
+	if user.Disabled {
+		http.Error(w, "user disabled", http.StatusForbidden)
+		return "", nil, false
+	}
+	return token, user, true
+}
+
+func (h *proxyHandler) serveCodexSetupScript(w http.ResponseWriter, r *http.Request) {
+	token := setupTokenFromPath(r.URL.Path, "/setup/codex/")
+	if token == "" {
 		http.Error(w, "invalid token", http.StatusBadRequest)
 		return
 	}
@@ -577,8 +638,7 @@ args = ["-NoLogo", "-NoProfile", "-File", "$mcpScriptToml", "$BaseUrl"]
 Write-Host 'Setup complete! You are ready to use the pool.'
 `, token, publicURL)
 
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(script))
+		writeSetupScriptResponse(w, "text/plain; charset=utf-8", script)
 		return
 	}
 
@@ -599,29 +659,7 @@ echo "1. Fetching credentials..."
 curl -sL "$BASE_URL/config/codex/$TOKEN" -o "$AUTH_FILE"
 chmod 600 "$AUTH_FILE"
 
-extract_access_token() {
-    python3 - "$1" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-except Exception:
-    raise SystemExit(0)
-
-token = ""
-if isinstance(data, dict):
-    nested = data.get("tokens")
-    if isinstance(nested, dict):
-        token = str(nested.get("access_token") or "").strip()
-    if not token:
-        token = str(data.get("access_token") or "").strip()
-
-if token:
-    print(token)
-PY
-}
+%s
 
 echo "2. Fetching model catalog..."
 ACCESS_TOKEN=$(extract_access_token "$AUTH_FILE")
@@ -863,15 +901,14 @@ EOF
 fi
 
 echo "Setup complete! You are ready to use the pool."
-`, token, publicURL)
+`, token, publicURL, bashExtractAccessTokenFunction())
 
-	w.Header().Set("Content-Type", "text/x-shellscript")
-	w.Write([]byte(script))
+	writeSetupScriptResponse(w, "text/x-shellscript", script)
 }
 
 func (h *proxyHandler) serveCLCodeSetupScript(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.URL.Path, "/setup/clcode/")
-	if token == "" || strings.Contains(token, "/") {
+	token := setupTokenFromPath(r.URL.Path, "/setup/clcode/")
+	if token == "" {
 		http.Error(w, "invalid token", http.StatusBadRequest)
 		return
 	}
@@ -1043,8 +1080,7 @@ Set-Utf8NoBom -Path $launcherFile -Value $launcher
 Write-Host "Setup complete. Run $launcherFile exec 'Reply with exactly OK.'"
 `, token, publicURL, fallbackCatalog, publicURL)
 
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(script))
+		writeSetupScriptResponse(w, "text/plain; charset=utf-8", script)
 		return
 	}
 
@@ -1070,29 +1106,7 @@ echo "1. Fetching credentials..."
 curl -fsSL "$BASE_URL/config/codex/$TOKEN" -o "$AUTH_FILE"
 chmod 600 "$AUTH_FILE"
 
-extract_access_token() {
-    python3 - "$1" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-except Exception:
-    raise SystemExit(0)
-
-token = ""
-if isinstance(data, dict):
-    nested = data.get("tokens")
-    if isinstance(nested, dict):
-        token = str(nested.get("access_token") or "").strip()
-    if not token:
-        token = str(data.get("access_token") or "").strip()
-
-if token:
-    print(token)
-PY
-}
+%s
 
 echo "2. Fetching model catalog..."
 ACCESS_TOKEN=$(extract_access_token "$AUTH_FILE")
@@ -1210,31 +1224,14 @@ EOF
 chmod 700 "$LAUNCHER_FILE"
 
 echo "Setup complete. Run clcode exec 'Reply with exactly OK.'"
-`, token, publicURL, fallbackCatalog, publicURL)
+`, token, publicURL, fallbackCatalog, bashExtractAccessTokenFunction(), publicURL)
 
-	w.Header().Set("Content-Type", "text/x-shellscript")
-	w.Write([]byte(script))
+	writeSetupScriptResponse(w, "text/x-shellscript", script)
 }
 
 func (h *proxyHandler) serveGeminiSetupScript(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.URL.Path, "/setup/gemini/")
-	if token == "" || strings.Contains(token, "/") {
-		http.Error(w, "invalid token", http.StatusBadRequest)
-		return
-	}
-
-	// Validate token and get user to generate credentials
-	if h.poolUsers == nil {
-		http.Error(w, "pool users not configured", http.StatusServiceUnavailable)
-		return
-	}
-	user := h.poolUsers.GetByToken(token)
-	if user == nil {
-		http.Error(w, "invalid token", http.StatusNotFound)
-		return
-	}
-	if user.Disabled {
-		http.Error(w, "user disabled", http.StatusForbidden)
+	_, user, ok := h.requireSetupPoolUser(w, r, "/setup/gemini/")
+	if !ok {
 		return
 	}
 
@@ -1335,8 +1332,7 @@ Write-Host ''
 Write-Host 'Start a new terminal, or run: . $PROFILE'
 `, publicURL, geminiAPIKey)
 
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(script))
+		writeSetupScriptResponse(w, "text/plain; charset=utf-8", script)
 		return
 	}
 
@@ -1427,29 +1423,15 @@ echo "Run 'source ~/.zshrc' or start a new terminal, then use this only if you n
 		geminiAPIKey, publicURL,
 		geminiAPIKey, publicURL)
 
-	w.Header().Set("Content-Type", "text/x-shellscript")
-	w.Write([]byte(script))
+	writeSetupScriptResponse(w, "text/x-shellscript", script)
 }
 
 func (h *proxyHandler) serveOpenCodeSetupScript(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.URL.Path, "/setup/opencode/")
-	if token == "" || strings.Contains(token, "/") {
-		http.Error(w, "invalid token", http.StatusBadRequest)
+	token, user, ok := h.requireSetupPoolUser(w, r, "/setup/opencode/")
+	if !ok {
 		return
 	}
-	if h.poolUsers == nil {
-		http.Error(w, "pool users not configured", http.StatusServiceUnavailable)
-		return
-	}
-	user := h.poolUsers.GetByToken(token)
-	if user == nil {
-		http.Error(w, "invalid token", http.StatusNotFound)
-		return
-	}
-	if user.Disabled {
-		http.Error(w, "user disabled", http.StatusForbidden)
-		return
-	}
+	_ = user
 
 	configURL := h.getEffectivePublicURL(r) + "/config/opencode/" + token
 
@@ -1493,8 +1475,7 @@ Write-Host ('Base URL: ' + $payload.base_url)
 Write-Host 'OpenCode will use codex-pool/gemini-3.1-pro-high via codex-pool /v1.'
 `, configURL)
 
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(script))
+		writeSetupScriptResponse(w, "text/plain; charset=utf-8", script)
 		return
 	}
 
@@ -1536,29 +1517,12 @@ echo ""
 echo "OpenCode will use codex-pool/gemini-3.1-pro-high via codex-pool /v1."
 `, configURL)
 
-	w.Header().Set("Content-Type", "text/x-shellscript")
-	w.Write([]byte(script))
+	writeSetupScriptResponse(w, "text/x-shellscript", script)
 }
 
 func (h *proxyHandler) serveClaudeSetupScript(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.URL.Path, "/setup/claude/")
-	if token == "" || strings.Contains(token, "/") {
-		http.Error(w, "invalid token", http.StatusBadRequest)
-		return
-	}
-
-	// Validate token and get user
-	if h.poolUsers == nil {
-		http.Error(w, "pool users not configured", http.StatusServiceUnavailable)
-		return
-	}
-	user := h.poolUsers.GetByToken(token)
-	if user == nil {
-		http.Error(w, "invalid token", http.StatusNotFound)
-		return
-	}
-	if user.Disabled {
-		http.Error(w, "user disabled", http.StatusForbidden)
+	_, user, ok := h.requireSetupPoolUser(w, r, "/setup/claude/")
+	if !ok {
 		return
 	}
 
@@ -1664,8 +1628,7 @@ Write-Host ''
 Write-Host 'Start a new terminal, or run: . $PROFILE'
 `, publicURL, claudeAuth.AccessToken)
 
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(script))
+		writeSetupScriptResponse(w, "text/plain; charset=utf-8", script)
 		return
 	}
 
@@ -1825,8 +1788,7 @@ fi
 		publicURL, claudeAuth.AccessToken, // python
 		publicURL, claudeAuth.AccessToken) // bash fallback
 
-	w.Header().Set("Content-Type", "text/x-shellscript")
-	w.Write([]byte(script))
+	writeSetupScriptResponse(w, "text/x-shellscript", script)
 }
 
 // hashAccountID creates a short anonymized hash of an account identifier
