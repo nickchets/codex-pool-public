@@ -18,10 +18,13 @@ References:
 
 Runtime credentials stay outside the repository. Docker's own docs warn against build-time secrets in build args or environment variables because they can persist in the final image. The Docker example therefore mounts `pool/` and `config.toml` at runtime.
 
+The repo also ships `.dockerignore` so local credentials, local config, git history, and release artifacts are excluded from the Docker build context before `COPY . .` runs.
+
 References:
 
 - https://docs.docker.com/compose/how-tos/environment-variables/best-practices/
 - https://docs.docker.com/build/building/secrets/
+- https://docs.docker.com/compose/how-tos/use-secrets/
 
 ## Windows Scripts
 

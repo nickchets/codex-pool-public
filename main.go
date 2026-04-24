@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const version = "0.11.0-codex-only"
+const version = "0.11.1-codex-only"
 
 func main() {
 	cfg := loadConfig()

@@ -21,6 +21,7 @@ Never commit:
 - Remote operator access requires `admin_token`.
 - Generated account files are written with `0600` permissions.
 - Docker examples mount secrets at runtime instead of copying them into the image.
+- `.dockerignore` keeps `pool/`, `config.toml`, local databases, logs, git history, and build artifacts out of the Docker build context.
 
 Docker documents that build args and environment variables are inappropriate for build-time secrets because they persist in images. Keep OpenAI credentials in runtime-mounted files or a secret manager.
 
@@ -30,6 +31,7 @@ Docker documents that build args and environment variables are inappropriate for
 go test ./...
 go build -o /tmp/codex-pool .
 bash -n scripts/*.sh
+test -f .dockerignore && rg -n 'pool|config.toml|\.git|dist' .dockerignore
 rg -n "Claude|Gemini|OpenCode|Anthropic|GitLab|Kimi|MiniMax|Antigravity" .
 rg -n 'sk-[A-Za-z0-9_-]{20,}|"(access_token|refresh_token|id_token)"[[:space:]]*:[[:space:]]*"[^"]+"' \
   --glob '!README.md' \

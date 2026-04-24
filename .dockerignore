@@ -1,0 +1,32 @@
+.git
+.github
+.air.toml
+.DS_Store
+.env
+.env.*
+.localnotes
+.playwright-mcp
+.code
+.idea
+.vscode
+
+# Runtime credentials and local state must never enter the Docker build context.
+pool
+data
+config.toml
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.log
+
+# Build and dependency outputs.
+codex-pool
+codex-pool.exe
+dist
+bin
+tmp
+coverage.out
+node_modules
+__pycache__
+*.pyc

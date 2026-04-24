@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.1
+
+- Added `.dockerignore` so credentials, local config, git history, and build artifacts never enter the Docker build context.
+- Documented the Docker build-context guard in the security and best-practices notes.
+
 ## 0.11.0
 
 - Rebuilt the public repository as a Codex/OpenAI-only pool.
