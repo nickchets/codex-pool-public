@@ -1,520 +1,72 @@
 package main
 
 import (
-	"log"
-	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
-// checkAdminAuth verifies the admin token from header or query param.
-// Returns true if authorized, false if not (and sends 401 response).
-func (h *proxyHandler) checkAdminAuth(w http.ResponseWriter, r *http.Request) bool {
-	if h.cfg.adminToken == "" {
-		// No admin token configured - deny all admin access
-		log.Printf("admin auth: no token configured")
-		http.Error(w, "admin access disabled", http.StatusForbidden)
-		return false
-	}
-
-	// Check header first, then query param
-	token := ""
-	if r != nil {
-		token = r.Header.Get("X-Admin-Token")
-		if token == "" {
-			token = r.URL.Query().Get("admin_token")
-		}
-	}
-
-	if h.cfg.debug {
-		log.Printf("admin auth: provided=%q configured=%q", token, h.cfg.adminToken)
-	}
-
-	if token != h.cfg.adminToken {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return false
-	}
-	return true
-}
-
-func (h *proxyHandler) matchesAdminToken(r *http.Request) bool {
-	if h == nil || h.cfg.adminToken == "" || r == nil {
-		return false
-	}
-	headerToken := r.Header.Get("X-Admin-Token")
-	queryToken := r.URL.Query().Get("admin_token")
-	return headerToken == h.cfg.adminToken || queryToken == h.cfg.adminToken
-}
-
-// checkAdminOrFriendAuth verifies either the admin token or the friend code.
-// This is used for "pool stats" endpoints that are intended to be accessible in friend mode
-// (with the friend code) while still allowing admin access when configured.
-func (h *proxyHandler) checkAdminOrFriendAuth(w http.ResponseWriter, r *http.Request) bool {
-	// If nothing is configured, treat as an open/local deployment.
-	if h.cfg.adminToken == "" && h.cfg.friendCode == "" {
-		return true
-	}
-
-	// Admin token (header first, then query param)
-	if h.matchesAdminToken(r) {
-		return true
-	}
-
-	// Friend code (query param or header)
-	if h.cfg.friendCode != "" {
-		queryCode := r.URL.Query().Get("code")
-		headerCode := r.Header.Get("X-Friend-Code")
-		if queryCode == h.cfg.friendCode || headerCode == h.cfg.friendCode {
-			return true
-		}
-	}
-
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
-	return false
-}
-
-func (h *proxyHandler) isTrustedLocalOperatorRequest(r *http.Request) bool {
-	if h == nil || r == nil || h.cfg.friendCode != "" {
-		return false
-	}
-	return !hasForwardingHeaders(r) && isLoopbackHost(r.Host) && isLoopbackRemoteAddr(r.RemoteAddr)
-}
-
-func isLoopbackRemoteAddr(remoteAddr string) bool {
-	host := strings.TrimSpace(remoteAddr)
-	if host == "" {
-		return false
-	}
-	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-		host = parsedHost
-	}
-	host = strings.Trim(host, "[]")
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-func isLoopbackHost(host string) bool {
-	value := strings.TrimSpace(host)
-	if value == "" {
-		return false
-	}
-	if parsedHost, _, err := net.SplitHostPort(value); err == nil {
-		value = parsedHost
-	}
-	value = strings.Trim(value, "[]")
-	if strings.EqualFold(value, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(value)
-	return ip != nil && ip.IsLoopback()
-}
-
-func hasForwardingHeaders(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	for _, header := range []string{"X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP", "Forwarded"} {
-		if strings.TrimSpace(r.Header.Get(header)) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *proxyHandler) checkLocalOperatorAuth(w http.ResponseWriter, r *http.Request) bool {
-	if h.cfg.friendCode != "" {
-		http.Error(w, "local operator flow disabled", http.StatusForbidden)
-		return false
-	}
-	if !h.isTrustedLocalOperatorRequest(r) {
-		http.Error(w, "loopback access required", http.StatusForbidden)
-		return false
-	}
-	return true
-}
-
-// ServeHTTP routes incoming requests to the appropriate handler.
-func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	reqID := randomID()
-	r = withRequestTrace(r, newRequestTrace(h.cfg, reqID, r))
-	if h.cfg.debug {
-		log.Printf("[%s] incoming %s %s", reqID, r.Method, r.URL.Path)
-	}
-
-	// Static routes
-	switch r.URL.Path {
-	case "/":
-		h.serveFriendLanding(w, r)
-		return
-	case "/status":
-		h.serveStatusPage(w, r)
-		return
-	case "/og-image.png":
-		h.serveOGImage(w, r)
-		return
-	case "/hero.png":
-		h.serveHeroImage(w, r)
-		return
-	case "/api/friend/claim":
-		h.handleFriendClaim(w, r)
-		return
-	case "/api/pool/stats":
-		h.handlePoolStats(w, r)
-		return
-	case "/api/pool/whoami":
-		h.handleWhoami(w, r)
-		return
-	case "/api/pool/users":
-		if !h.checkAdminOrFriendAuth(w, r) {
-			return
-		}
-		h.handlePoolUsers(w, r)
-		return
-	case "/api/pool/daily-breakdown":
-		if !h.checkAdminOrFriendAuth(w, r) {
-			return
-		}
-		h.handleDailyBreakdown(w, r)
-		return
-	case "/api/pool/hourly":
-		if !h.checkAdminOrFriendAuth(w, r) {
-			return
-		}
-		h.handleGlobalHourly(w, r)
-		return
-	case "/operator/codex/oauth-start":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorCodexAdd(w, r)
-		return
-	case "/operator/codex/api-key-add":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorCodexAPIKeyAdd(w, r)
-		return
-	case "/operator/claude/gitlab-token-add":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorClaudeGitLabTokenAdd(w, r)
-		return
-	case "/operator/gemini/account-add", "/operator/gemini/import-oauth-creds":
-		// Legacy local/manual Gemini import routes are intentionally retired.
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path == "/":
+		s.serveHome(w, r)
+	case r.URL.Path == "/healthz":
+		respondJSON(w, map[string]any{"status": "ok", "version": version})
+	case r.URL.Path == "/status":
+		s.serveStatus(w, r)
+	case r.URL.Path == "/config/codex.toml":
+		s.serveCodexConfig(w, r)
+	case r.URL.Path == "/setup/codex.sh":
+		s.serveShellSetup(w, r)
+	case r.URL.Path == "/setup/codex.ps1":
+		s.servePowerShellSetup(w, r)
+	case r.URL.Path == "/admin/reload":
+		s.handleReload(w, r)
+	case r.URL.Path == "/admin/accounts":
+		s.handleAccounts(w, r)
+	case r.URL.Path == "/operator/codex/oauth-start":
+		s.startCodexOAuth(w, r)
+	case r.URL.Path == "/operator/codex/api-key-add":
+		s.saveAPIKey(w, r)
+	case r.URL.Path == "/oauth/token":
+		s.fakeOAuthToken(w, r)
+	case isProxyPath(r.URL.Path):
+		s.proxyCodex(w, r)
+	default:
 		http.NotFound(w, r)
-		return
-	case "/operator/gemini/oauth-start":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiAntigravityOAuthStart(w, r)
-		return
-	case "/operator/gemini/antigravity/oauth-start":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiAntigravityOAuthStart(w, r)
-		return
-	case "/operator/gemini/oauth-callback":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiOAuthCallback(w, r)
-		return
-	case "/operator/gemini/antigravity/oauth-callback", antigravityOAuthCallbackPath:
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiAntigravityOAuthCallback(w, r)
-		return
-	case "/operator/gemini/seat-smoke":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiSeatSmoke(w, r)
-		return
-	case "/operator/gemini/reset-bundle":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiResetBundle(w, r)
-		return
-	case "/operator/gemini/reset-delete":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiResetDelete(w, r)
-		return
-	case "/operator/gemini/reset-rollback":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorGeminiResetRollback(w, r)
-		return
-	case "/operator/account-delete":
-		if !h.checkLocalOperatorAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.handleOperatorAccountDelete(w, r)
-		return
-	case "/favicon.ico":
-		http.NotFound(w, r)
-		return
-	case "/healthz":
-		h.serveHealth(w)
-		return
-	case "/metrics":
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		h.metrics.serve(w, r)
-		return
-	case "/admin/reload":
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.reloadAccounts()
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-		return
-	case "/admin/accounts":
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.serveAccounts(w)
-		return
-	case "/admin/pool/dashboard":
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.servePoolDashboard(w, r)
-		return
-	case "/admin/tokens":
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.serveTokenCapacity(w)
-		return
-	case "/admin/clear-rate-limits":
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.clearAllRateLimits(w)
-		return
-	case "/admin/purge-anonymous":
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		h.purgeAnonymousUsers(w)
-		return
 	}
+}
 
-	// Account resurrect: /admin/accounts/:id/resurrect
-	if strings.HasPrefix(r.URL.Path, "/admin/accounts/") && strings.HasSuffix(r.URL.Path, "/resurrect") {
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		// Extract account ID from path
-		path := strings.TrimPrefix(r.URL.Path, "/admin/accounts/")
-		accountID := strings.TrimSuffix(path, "/resurrect")
-		h.resurrectAccount(w, accountID)
-		return
-	}
+func isProxyPath(path string) bool {
+	return strings.HasPrefix(path, "/v1/") ||
+		strings.HasPrefix(path, "/responses") ||
+		strings.HasPrefix(path, "/backend-api/") ||
+		strings.HasPrefix(path, "/ws") ||
+		strings.HasPrefix(path, "/api/codex/")
+}
 
-	// Account force refresh: /admin/accounts/:id/refresh
-	if strings.HasPrefix(r.URL.Path, "/admin/accounts/") && strings.HasSuffix(r.URL.Path, "/refresh") {
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		path := strings.TrimPrefix(r.URL.Path, "/admin/accounts/")
-		accountID := strings.TrimSuffix(path, "/refresh")
-		h.forceRefreshAccount(w, accountID)
+func (s *server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
 		return
 	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.reloadPool(); err != nil {
+		respondJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respondJSON(w, map[string]any{"status": "ok", "accounts": s.pool.count()})
+}
 
-	// Friend landing page with code
-	if strings.HasPrefix(r.URL.Path, "/friend/") {
-		h.serveFriendLanding(w, r)
+func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdmin(w, r) {
 		return
 	}
-
-	// User daily usage: /api/pool/users/:id/daily
-	if strings.HasPrefix(r.URL.Path, "/api/pool/users/") && strings.HasSuffix(r.URL.Path, "/daily") {
-		h.handleUserDaily(w, r)
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// User hourly usage: /api/pool/users/:id/hourly
-	if strings.HasPrefix(r.URL.Path, "/api/pool/users/") && strings.HasSuffix(r.URL.Path, "/hourly") {
-		h.handleUserHourly(w, r)
-		return
-	}
-
-	// Setup scripts
-	if strings.HasPrefix(r.URL.Path, "/setup/codex/") {
-		h.serveCodexSetupScript(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/setup/clcode/") {
-		h.serveCLCodeSetupScript(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/setup/opencode/") {
-		h.serveOpenCodeSetupScript(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/setup/gemini/") {
-		h.serveGeminiSetupScript(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/setup/claude/") {
-		h.serveClaudeSetupScript(w, r)
-		return
-	}
-
-	// Pool user admin routes
-	if strings.HasPrefix(r.URL.Path, "/admin/pool-users") {
-		if !h.checkAdminAuth(w, r) {
-			return
-		}
-		h.servePoolUsersAdmin(w, r)
-		return
-	}
-
-	// Claude account admin routes (friend auth - accessible from friend landing page)
-	// Note: /admin/claude/callback skips auth (OAuth redirect from Anthropic)
-	if strings.HasPrefix(r.URL.Path, "/admin/claude") {
-		if r.URL.Path != "/admin/claude/callback" {
-			if !h.checkAdminOrFriendAuth(w, r) {
-				return
-			}
-		}
-		h.serveClaudeAdmin(w, r)
-		return
-	}
-
-	// Codex account admin routes (friend auth - accessible from friend landing page)
-	if strings.HasPrefix(r.URL.Path, "/admin/codex") {
-		if !h.checkAdminOrFriendAuth(w, r) {
-			return
-		}
-		h.serveCodexAdmin(w, r)
-		return
-	}
-
-	// Config download routes (no auth - token is the auth)
-	if strings.HasPrefix(r.URL.Path, "/config/codex/") || strings.HasPrefix(r.URL.Path, "/config/opencode/") || strings.HasPrefix(r.URL.Path, "/config/gemini/") || strings.HasPrefix(r.URL.Path, "/config/claude/") {
-		h.serveConfigDownload(w, r)
-		return
-	}
-
-	// Fake refresh handler so Codex CLI never needs to hit the real auth server.
-	if strings.HasPrefix(r.URL.Path, "/oauth/token") {
-		h.serveFakeOAuthToken(w, r)
-		return
-	}
-
-	// Special case: aggregate usage for client; do not hit upstream.
-	if isUsageRequest(r) {
-		h.refreshUsageIfStale()
-		h.handleAggregatedUsage(w, reqID)
-		return
-	}
-
-	// Claude-specific endpoints - return pool info instead of individual account info
-	if isClaudeProfileRequest(r) {
-		h.handleClaudeProfile(w, r)
-		return
-	}
-	if isClaudeUsageRequest(r) {
-		h.handleClaudeUsage(w, r)
-		return
-	}
-
-	// Default: proxy to upstream
-	h.proxyRequest(w, r, reqID)
+	respondJSON(w, s.pool.summaries(time.Now().UTC()))
 }

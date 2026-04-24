@@ -1,164 +1,130 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
-	"io"
-	"net"
+	"fmt"
 	"net/http"
-	"net/textproto"
+	"net/url"
+	"strconv"
 	"strings"
+	"time"
+	"unicode"
 )
 
-func randomID() string {
-	var b [6]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "unknown"
-	}
-	return hex.EncodeToString(b[:])
-}
-
-func safeText(b []byte) string {
-	s := string(b)
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\r", "\\r")
-	return s
-}
-
-// getClientIP extracts the client IP from the request, checking common proxy headers.
-func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For first (may contain multiple IPs)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	// Check X-Real-IP
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	// Check CF-Connecting-IP (Cloudflare)
-	if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
-		return cfip
-	}
-	// Fall back to RemoteAddr
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return ip
-}
-
-func respondJSON(w http.ResponseWriter, v any) {
+func respondJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
-	_ = enc.Encode(v)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(payload)
 }
 
-// shouldStreamBody returns true when the request body should be streamed directly
-// instead of fully buffered in memory.
-func shouldStreamBody(r *http.Request, maxInMem int64) bool {
-	if r == nil {
-		return false
-	}
-	if r.ContentLength < 0 {
-		return true
-	}
-	if maxInMem <= 0 {
-		return false
-	}
-	return r.ContentLength > maxInMem
+func respondJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": message})
 }
 
-// readBodyForReplay reads the full body into memory so we can retry requests across accounts.
-// It also returns a bounded sample for logging.
-func readBodyForReplay(body io.ReadCloser, wantSample bool, sampleLimit int64) (full []byte, sample []byte, err error) {
-	if body == nil {
-		return nil, nil, nil
+func singleJoin(basePath, childPath string) string {
+	basePath = strings.TrimRight(basePath, "/")
+	childPath = "/" + strings.TrimLeft(childPath, "/")
+	if basePath == "" {
+		return childPath
 	}
-	defer body.Close()
-	full, err = io.ReadAll(body)
-	if err != nil {
-		return nil, nil, err
+	if childPath == "/" {
+		return basePath
 	}
-	if wantSample && sampleLimit > 0 {
-		if int64(len(full)) > sampleLimit {
-			sample = full[:sampleLimit]
-		} else {
-			sample = full
+	return basePath + childPath
+}
+
+func cloneURL(u *url.URL) *url.URL {
+	if u == nil {
+		return nil
+	}
+	cp := *u
+	return &cp
+}
+
+func safeText(raw []byte) string {
+	text := string(raw)
+	text = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
 		}
-	}
-	return full, sample, nil
-}
-
-func cloneHeader(h http.Header) http.Header {
-	out := make(http.Header, len(h))
-	for k, vv := range h {
-		cpy := make([]string, len(vv))
-		copy(cpy, vv)
-		out[k] = cpy
-	}
-	return out
-}
-
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		dst.Del(k)
-		for _, v := range vv {
-			dst.Add(k, v)
+		if unicode.IsControl(r) {
+			return -1
 		}
+		return r
+	}, text)
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 500 {
+		return text[:500] + "..."
 	}
+	return text
 }
 
-// removeHopByHopHeaders strips headers that must not be forwarded by proxies.
-func removeHopByHopHeaders(h http.Header) {
-	// Strip any headers listed in the Connection header first.
-	if c := h.Get("Connection"); c != "" {
-		for _, f := range strings.Split(c, ",") {
-			if f = strings.TrimSpace(f); f != "" {
-				h.Del(textproto.CanonicalMIMEHeaderKey(f))
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(value); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(value); err == nil {
+		return time.Until(t)
+	}
+	return 0
+}
+
+func bearerFromHeaders(h http.Header) string {
+	auth := strings.TrimSpace(h.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[len("Bearer "):])
+	}
+	return ""
+}
+
+func rewriteWebSocketBearer(headers http.Header, token string) {
+	if token == "" {
+		return
+	}
+	const prefix = "openai-insecure-api-key."
+	values := headers.Values("Sec-WebSocket-Protocol")
+	if len(values) == 0 {
+		return
+	}
+	headers.Del("Sec-WebSocket-Protocol")
+	for _, value := range values {
+		parts := strings.Split(value, ",")
+		for i, part := range parts {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(part, prefix) {
+				part = prefix + token
 			}
+			parts[i] = part
 		}
-	}
-
-	// Standard hop-by-hop headers.
-	for _, k := range []string{
-		"Connection",
-		"Proxy-Connection",
-		"Keep-Alive",
-		"Proxy-Authenticate",
-		"Proxy-Authorization",
-		"Te",
-		"Trailer",
-		"Transfer-Encoding",
-		"Upgrade",
-	} {
-		h.Del(k)
+		headers.Add("Sec-WebSocket-Protocol", strings.Join(parts, ", "))
 	}
 }
 
-func headerContainsToken(h http.Header, name, token string) bool {
-	for _, value := range h.Values(name) {
-		for _, part := range strings.Split(value, ",") {
-			if strings.EqualFold(strings.TrimSpace(part), token) {
-				return true
-			}
-		}
-	}
-	return false
+func isUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Connection"), "Upgrade") || strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
 }
 
-func isWebSocketUpgradeRequest(r *http.Request) bool {
-	if r == nil {
-		return false
+func publicBaseURL(cfg config, r *http.Request) string {
+	if cfg.PublicURL != "" {
+		return cfg.PublicURL
 	}
-	return headerContainsToken(r.Header, "Connection", "Upgrade") &&
-		strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket")
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
+	scheme := "http"
+	if r != nil && r.TLS != nil {
+		scheme = "https"
 	}
-	return b
+	host := cfg.ListenAddr
+	if r != nil && strings.TrimSpace(r.Host) != "" {
+		host = r.Host
+	}
+	if strings.HasPrefix(host, ":") {
+		host = "127.0.0.1" + host
+	}
+	return fmt.Sprintf("%s://%s", scheme, host)
 }

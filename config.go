@@ -1,144 +1,115 @@
 package main
 
 import (
+	"flag"
+	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
 
-// ConfigFile represents the config.toml structure.
-type ConfigFile struct {
-	ListenAddr                 string  `toml:"listen_addr"`
-	PoolDir                    string  `toml:"pool_dir"`
-	DBPath                     string  `toml:"db_path"`
-	MaxAttempts                int     `toml:"max_attempts"`
-	ForceCodexRequiredPlan     string  `toml:"force_codex_required_plan"`
-	GitLabCodexDiscoveryModels string  `toml:"gitlab_codex_discovery_models"`
-	DisableRefresh             bool    `toml:"disable_refresh"`
-	RefreshProxyURL            string  `toml:"refresh_proxy_url"` // HTTP proxy for refresh operations
-	Debug                      bool    `toml:"debug"`
-	PublicURL                  string  `toml:"public_url"`
-	FriendCode                 string  `toml:"friend_code"`
-	FriendName                 string  `toml:"friend_name"`
-	FriendTagline              string  `toml:"friend_tagline"`
-	AdminToken                 string  `toml:"admin_token"`
-	TierThreshold              float64 `toml:"tier_threshold"` // Secondary usage % threshold for tier preference (default 0.15)
-
-	PoolUsers PoolUsersConfig `toml:"pool_users"`
+type configFile struct {
+	ListenAddr          string `toml:"listen_addr"`
+	PoolDir             string `toml:"pool_dir"`
+	PublicURL           string `toml:"public_url"`
+	AdminToken          string `toml:"admin_token"`
+	SharedProxyToken    string `toml:"shared_proxy_token"`
+	DisableRefresh      bool   `toml:"disable_refresh"`
+	MaxAttempts         int    `toml:"max_attempts"`
+	RequestTimeoutSecs  int    `toml:"request_timeout_seconds"`
+	StreamIdleSecs      int    `toml:"stream_idle_timeout_seconds"`
+	UpstreamCodexBase   string `toml:"upstream_codex_base"`
+	UpstreamBackendBase string `toml:"upstream_backend_base"`
+	UpstreamAPIBase     string `toml:"upstream_openai_api_base"`
+	UpstreamAuthBase    string `toml:"upstream_auth_base"`
 }
 
-// getFriendName returns the configured friend name for the landing page.
-func getFriendName() string {
-	if v := os.Getenv("FRIEND_NAME"); v != "" {
+type config struct {
+	ListenAddr       string
+	PoolDir          string
+	PublicURL        string
+	AdminToken       string
+	SharedProxyToken string
+	DisableRefresh   bool
+	MaxAttempts      int
+	RequestTimeout   time.Duration
+	StreamIdle       time.Duration
+	CodexBase        *url.URL
+	BackendBase      *url.URL
+	APIBase          *url.URL
+	AuthBase         *url.URL
+}
+
+func loadConfig() config {
+	var file configFile
+	configPath := getString("CODEX_POOL_CONFIG", "", "config.toml")
+	if _, err := os.Stat(configPath); err == nil {
+		if _, err := toml.DecodeFile(configPath, &file); err != nil {
+			log.Printf("warning: could not parse %s: %v", configPath, err)
+		}
+	}
+
+	cfg := config{
+		ListenAddr:       getString("CODEX_POOL_LISTEN_ADDR", file.ListenAddr, "127.0.0.1:8989"),
+		PoolDir:          getString("CODEX_POOL_DIR", file.PoolDir, "pool"),
+		PublicURL:        strings.TrimRight(getString("CODEX_POOL_PUBLIC_URL", file.PublicURL, ""), "/"),
+		AdminToken:       getString("CODEX_POOL_ADMIN_TOKEN", file.AdminToken, ""),
+		SharedProxyToken: getString("CODEX_POOL_SHARED_PROXY_TOKEN", file.SharedProxyToken, ""),
+		DisableRefresh:   getBool("CODEX_POOL_DISABLE_REFRESH", file.DisableRefresh),
+		MaxAttempts:      getInt("CODEX_POOL_MAX_ATTEMPTS", file.MaxAttempts, 3),
+		RequestTimeout:   time.Duration(getInt("CODEX_POOL_REQUEST_TIMEOUT_SECONDS", file.RequestTimeoutSecs, 300)) * time.Second,
+		StreamIdle:       time.Duration(getInt("CODEX_POOL_STREAM_IDLE_TIMEOUT_SECONDS", file.StreamIdleSecs, 600)) * time.Second,
+		CodexBase:        mustURL(getString("CODEX_POOL_UPSTREAM_CODEX_BASE", file.UpstreamCodexBase, "https://chatgpt.com/backend-api/codex")),
+		BackendBase:      mustURL(getString("CODEX_POOL_UPSTREAM_BACKEND_BASE", file.UpstreamBackendBase, "https://chatgpt.com/backend-api")),
+		APIBase:          mustURL(getString("CODEX_POOL_UPSTREAM_OPENAI_API_BASE", file.UpstreamAPIBase, "https://api.openai.com")),
+		AuthBase:         mustURL(getString("CODEX_POOL_UPSTREAM_AUTH_BASE", file.UpstreamAuthBase, "https://auth.openai.com")),
+	}
+
+	flag.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "listen address")
+	flag.StringVar(&cfg.PoolDir, "pool-dir", cfg.PoolDir, "directory containing Codex/OpenAI account JSON files")
+	flag.StringVar(&cfg.PublicURL, "public-url", cfg.PublicURL, "public base URL used in generated config")
+	flag.Parse()
+	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
+	return cfg
+}
+
+func getString(envKey, fileValue, defaultValue string) string {
+	if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
 		return v
 	}
-	if globalConfigFile != nil && globalConfigFile.FriendName != "" {
-		return globalConfigFile.FriendName
-	}
-	return "PP" // default
-}
-
-// getFriendTagline returns the configured tagline for the landing page.
-func getFriendTagline() string {
-	if v := os.Getenv("FRIEND_TAGLINE"); v != "" {
-		return v
-	}
-	if globalConfigFile != nil && globalConfigFile.FriendTagline != "" {
-		return globalConfigFile.FriendTagline
-	}
-	return "For the few who know, the pool awaits. Unlimited resources. Zero friction."
-}
-
-// PoolUsersConfig is the [pool_users] section.
-type PoolUsersConfig struct {
-	JWTSecret   string `toml:"jwt_secret"`
-	StoragePath string `toml:"storage_path"`
-}
-
-// loadConfigFile loads config.toml if it exists.
-// Returns nil if the file doesn't exist.
-func loadConfigFile(path string) (*ConfigFile, error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil, nil
-	}
-
-	var cfg ConfigFile
-	if _, err := toml.DecodeFile(path, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
-}
-
-// getConfigString returns the config value with priority: env var > config file > default.
-func getConfigString(envKey string, configValue string, defaultValue string) string {
-	if v := os.Getenv(envKey); v != "" {
-		return v
-	}
-	if configValue != "" {
-		return configValue
+	if strings.TrimSpace(fileValue) != "" {
+		return strings.TrimSpace(fileValue)
 	}
 	return defaultValue
 }
 
-// getConfigInt returns the config value with priority: env var > config file > default.
-func getConfigInt(envKey string, configValue int, defaultValue int) int {
-	if v := os.Getenv(envKey); v != "" {
-		if n, err := parseInt64(v); err == nil && n > 0 {
-			return int(n)
+func getInt(envKey string, fileValue, defaultValue int) int {
+	if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
 		}
 	}
-	if configValue > 0 {
-		return configValue
+	if fileValue > 0 {
+		return fileValue
 	}
 	return defaultValue
 }
 
-// getConfigFloat64 returns the config value with priority: env var > config file > default.
-func getConfigFloat64(envKey string, configValue float64, defaultValue float64) float64 {
-	if v := os.Getenv(envKey); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
+func getBool(envKey string, fileValue bool) bool {
+	if v := strings.TrimSpace(strings.ToLower(os.Getenv(envKey))); v != "" {
+		return v == "1" || v == "true" || v == "yes" || v == "on"
 	}
-	if configValue > 0 {
-		return configValue
-	}
-	return defaultValue
+	return fileValue
 }
 
-// getConfigBool returns the config value with priority: env var > config file > default.
-func getConfigBool(envKey string, configValue bool, defaultValue bool) bool {
-	if v := os.Getenv(envKey); v != "" {
-		return v == "1" || v == "true"
+func mustURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		log.Fatalf("invalid URL %q: %v", raw, err)
 	}
-	if configValue {
-		return true
-	}
-	return defaultValue
-}
-
-func parseCSVEnvList(raw string) []string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	parts := strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' '
-	})
-	out := make([]string, 0, len(parts))
-	seen := make(map[string]struct{}, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if _, ok := seen[part]; ok {
-			continue
-		}
-		seen[part] = struct{}{}
-		out = append(out, part)
-	}
-	return out
+	return u
 }

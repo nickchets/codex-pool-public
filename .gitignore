@@ -28,6 +28,7 @@ config.toml
 # Build artifacts
 codex-pool
 codex-pool-proxy
+codex-pool.exe
 codex-pool-linux
 codex-pool-linux-*
 codex-pool-proxy-linux

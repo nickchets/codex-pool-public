@@ -1,127 +1,83 @@
 # Install
 
-## 1. Clone This Repository
+`codex-pool` is a single Go binary. It should usually run on the same machine as Codex CLI and bind to loopback.
+
+## Requirements
+
+- Go 1.24 or newer
+- Codex CLI installed separately
+- At least one ChatGPT Codex login or one OpenAI API key
+
+OpenAI documents Codex CLI installation through `npm i -g @openai/codex` and notes that Codex CLI can authenticate with either ChatGPT sign-in or an API key. The pool supports those same two OpenAI credential types.
+
+## Linux
 
 ```bash
-git clone git@github.com:<you>/codex-pool-orchestrator.git
-cd codex-pool-orchestrator
-go build -o ~/.local/bin/codex-pool .
-```
-
-## 2. Create Runtime Layout
-
-```bash
-runtime_root="$HOME/.local/share/codex-pool/runtime"
-mkdir -p "$runtime_root"/{pool/codex,data,backups,quarantine}
-```
-
-Expected runtime layout:
-
-- `config.toml`
-- `codex-pool.env`
-- `pool/codex/`
-- `data/`
-- `backups/`
-- `quarantine/`
-
-## 3. Install User Service
-
-```bash
-mkdir -p "$HOME/.config/systemd/user"
-cp /path/to/codex-pool-orchestrator/systemd/codex-pool.service "$HOME/.config/systemd/user/"
-systemctl --user daemon-reload
-systemctl --user enable --now codex-pool.service
-```
-
-## 4. Configure The Runtime
-
-The service reads these environment variables when present:
-
-- `CODEX_POOL_RUNTIME_ROOT`
-- `CODEX_HOME`
-- `CODEX_POOL_SERVICE_NAME`
-- `CODEX_POOL_BASE_URL`
-- `CODEX_POOL_CALLBACK_HOST`
-- `CODEX_POOL_CALLBACK_PORT`
-
-Reasonable defaults are used if they are omitted.
-
-## 5. Use The Operator Surface
-
-Health check:
-
-```bash
+git clone https://github.com/nickchets/codex-pool-public.git
+cd codex-pool-public
+bash scripts/install-linux-systemd.sh
+systemctl --user status codex-pool.service --no-pager
 curl -fsS http://127.0.0.1:8989/healthz
 ```
 
-Machine-readable status:
+The installer builds `~/.local/bin/codex-pool`, creates `~/.config/codex-pool/config.toml` if missing, installs a user systemd unit, and starts it.
+
+## macOS
 
 ```bash
-curl -fsS http://127.0.0.1:8989/status?format=json | jq .
+git clone https://github.com/nickchets/codex-pool-public.git
+cd codex-pool-public
+bash scripts/install-macos-launchd.sh
+launchctl print gui/$(id -u)/com.codex-pool
+curl -fsS http://127.0.0.1:8989/healthz
 ```
 
-Preferred web surfaces:
+The installer builds `~/Library/Application Support/codex-pool/bin/codex-pool`, writes a LaunchAgent plist, and starts it with `launchctl bootstrap`.
 
-- `http://127.0.0.1:8989/` for the dashboard-first operator view
-- `http://127.0.0.1:8989/status` for the raw operator dashboard and JSON status contract
+## Windows
 
-Preferred add-account flows:
+Run from PowerShell in the repository:
+
+```powershell
+.\scripts\install-windows-task.ps1
+Invoke-RestMethod http://127.0.0.1:8989/healthz
+```
+
+The installer builds `%LOCALAPPDATA%\codex-pool\codex-pool.exe`, writes `config.toml`, and registers a per-user scheduled task.
+
+## Docker
+
+Docker is useful for isolated testing. Do not bake secrets into images. Mount `pool/` and `config.toml` at runtime.
 
 ```bash
-# Codex: click "Start Codex OAuth" on `/` or `/status`
-# Gemini: click "Start Gemini Browser Auth" on `/` or `/status`
-# Gemini client path: run the per-user /setup/opencode/... bundle, then use
-# opencode run -m codex-pool/gemini-3.1-pro-high "Reply with exactly OK."
+cp config.toml.example config.toml
+mkdir -p pool/codex pool/openai_api
+docker compose up --build
 ```
 
-Low-level OAuth fallback:
+## Add Credentials
+
+ChatGPT Codex login:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:8989/operator/codex/oauth-start | jq .
+mkdir -p pool/codex
+cp ~/.codex/auth.json pool/codex/main.json
+chmod 600 pool/codex/main.json
 ```
 
-## Optional: GitLab Codex Sidecar (`clcode`)
-
-Use this only when you want an isolated Codex CLI lane backed purely by GitLab Codex seats, without touching the main mixed pool on `127.0.0.1:8989`.
-
-Suggested runtime layout:
+OpenAI API key:
 
 ```bash
-gitlab_runtime_root="$HOME/.local/share/codex-pool-gitlab/runtime"
-go build -o "$HOME/.local/bin/codex-pool-gitlab" .
-mkdir -p "$gitlab_runtime_root"/{pool/codex,data,backups,quarantine}
-cp /path/to/codex-pool-orchestrator/systemd/codex-pool-gitlab.service "$HOME/.config/systemd/user/"
+mkdir -p pool/openai_api
+printf '{"OPENAI_API_KEY":"%s"}\n' "$OPENAI_API_KEY" > pool/openai_api/main.json
+chmod 600 pool/openai_api/main.json
 ```
 
-Minimal `"$gitlab_runtime_root/codex-pool.env"`:
+## Verify
 
 ```bash
-PROXY_LISTEN_ADDR=127.0.0.1:8993
-POOL_DIR=pool
-PROXY_DB_PATH=./data/proxy.db
-POOL_USERS_PATH=./data/pool_users.json
-PROXY_FORCE_CODEX_REQUIRED_PLAN=gitlab_duo
-ADMIN_TOKEN=<generate-a-unique-admin-token>
-POOL_JWT_SECRET=<generate-a-unique-jwt-secret>
-PUBLIC_URL=http://127.0.0.1:8993
+go test ./...
+go build -o /tmp/codex-pool .
+curl -fsS http://127.0.0.1:8989/status?format=json
+codex "Reply with exactly OK."
 ```
-
-Then enable the sidecar:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now codex-pool-gitlab.service
-curl -fsS http://127.0.0.1:8993/healthz
-```
-
-Per-user setup flow for the isolated CLI lane:
-
-```bash
-CODEX_POOL_RUNTIME_ROOT="$HOME/.local/share/codex-pool-gitlab/runtime" \
-CODEX_POOL_BASE_URL="http://127.0.0.1:8993" \
-python3 orchestrator/codex_pool_manager.py bootstrap-clcode --email you@example.com
-
-clcode exec 'Reply with exactly OK.'
-```
-
-`clcode` installs an isolated Codex home under `~/.local/share/clcode/` and does not mutate the main `~/.codex`.
